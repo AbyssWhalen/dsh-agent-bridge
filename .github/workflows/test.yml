@@ -1,0 +1,36 @@
+# The offline half of the suite. No desktop client, no network, no DSH install.
+#
+# The vendor drivers are not exercised here by design: they talk to Qoder and
+# WorkBuddy on a signed-in machine, and a CI runner has none of that.
+# What is left is exactly the part that can be proven anywhere — effort
+# normalisation, the mount/teardown race, the component switches, and the two
+# settings routes with their auth boundary.
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  offline:
+    # The plugin is Windows-only (every driver locates its client through Windows
+    # paths and credential files), so the platform that ships is the platform that
+    # runs the tests.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install
+        run: npm install --no-audit --no-fund
+
+      - name: Offline suite
+        run: npm test
+
+      - name: Host integration
+        run: npm run test:host

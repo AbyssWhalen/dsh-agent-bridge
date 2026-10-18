@@ -1,0 +1,5 @@
+{
+  "name": "bridge-integration",
+  "private": true,
+  "type": "module"
+}

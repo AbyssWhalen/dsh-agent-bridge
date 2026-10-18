@@ -1,0 +1,5 @@
+# Keep the checked-in line endings stable: this is a Windows-only plugin, but the
+# source is read by tools (and by people on other machines) that expect LF.
+* text=auto eol=lf
+*.png binary
+*.ps1 text eol=crlf

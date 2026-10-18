@@ -1,0 +1,82 @@
+{
+  "name": "dsh-agent-bridge",
+  "displayName": "DSH Agent Bridge",
+  "version": "1.0.0",
+  "description": "把本机 AI 桌面客户端（Qoder / WorkBuddy）里已登录的模型反向代理进 DeepSeek Harness — bring the models of local AI desktop clients into DeepSeek Harness as extra providers.",
+  "author": "AbyssWhalen",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "deepseek",
+    "qoder",
+    "workbuddy",
+    "model-provider",
+    "reverse-proxy"
+  ],
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "drivers",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test/efforts.mjs && node test/teardown.mjs && node test/components.mjs && node test/compat.mjs && node test/tools.mjs && node test/dsml.mjs && node test/dsml-stream.mjs && node test/dsml-history.mjs && node test/dsml-boundary.mjs && node test/dsml-variant.mjs && node test/qoder-calls.mjs && node test/quota-failure.mjs && node test/catalog-refresh.mjs",
+    "test:host": "node test/integration/host.mjs",
+    "test:soak": "node test/integration/soak.mjs",
+    "test:collision": "node test/integration/collision.mjs",
+    "test:live": "node test/qoder-live.mjs && node test/workbuddy-live.mjs && node test/tools-live.mjs",
+    "check": "npm test && npm run test:host && npm run test:collision"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AbyssWhalen/dsh-agent-bridge.git"
+  },
+  "homepage": "https://github.com/AbyssWhalen/dsh-agent-bridge#readme",
+  "bugs": "https://github.com/AbyssWhalen/dsh-agent-bridge/issues",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
+      ]
+    },
+    "compat": {
+      "runtime": "^0.2.0-rc.2",
+      "verified": [
+        "0.2.0-rc.2"
+      ],
+      "checked": {
+        "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
+        "@deepseek-ai/dsh-client-ui-plugin-manager": "0.2.0-rc.2",
+        "@deepseek-ai/cordis": "4.0.4",
+        "node": "24.21.0"
+      }
+    }
+  },
+  "dependencies": {},
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-llm": "^0.2.0-rc.2"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
+    "semver": "^7.7.2"
+  }
+}

@@ -1,0 +1,26 @@
+# One row per vendor, both from the same package.
+#
+# DSH's Plugins page renders a bundle's rows as «包含的组件» and gives each row its
+# own switch and its own page, so two rows is what makes this one package read as
+# two components: switch Qoder off and WorkBuddy keeps serving; uninstall
+# WorkBuddy's driver and Qoder never notices. Each row reaches the same module with
+# a different `config.component`, which is the only thing that differs between them.
+#
+# The row id is what the plugin's per-row page is keyed by (`plugins.row.config`,
+# key `dsh-agent-bridge#<row id>`), so renaming one here means renaming it there.
+# A driver whose desktop app is missing or broken leaves its own row reporting the
+# reason and does not affect the other.
+#
+# The provider group each row registers is the component id it names, and nothing
+# here changes the profile's default model.
+
+- insert:
+    - id: agent-bridge-workbuddy
+      name: dsh-agent-bridge
+      config:
+        component: workbuddy
+
+    - id: agent-bridge-qoder
+      name: dsh-agent-bridge
+      config:
+        component: qoder
