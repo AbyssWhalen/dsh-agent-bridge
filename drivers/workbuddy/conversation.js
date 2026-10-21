@@ -18,7 +18,7 @@
  * @module dsh-agent-bridge/drivers/workbuddy/conversation
  */
 import { endsWithMarkerPrefix, hasLeak, hasNativeLeak, MARKER_MAX, parseLeakedCalls, stripLeak } from '../../lib/dsml.js';
-import { assistantProse, flattenConversation, messageText, splitSystem } from '../../lib/messages.js';
+import { assistantProse, flattenConversation, messageText, splitSystem, toolCallsOf } from '../../lib/messages.js';
 import { UpstreamFailure } from './upstream.js';
 
 /** How long a stream may go without a frame before it is considered stalled. */
@@ -468,16 +468,36 @@ export function toWireTools(tools) {
  * them into prose loses the id that ties a result to its call, and the upstream
  * rejects a `tool` message that answers nothing.
  *
- * @param {{role: string, text: string, toolCalls?: {id: string, name: string, arguments: string}[], toolCallId?: string}[]} messages
+ * ## Why the calls are read twice
+ *
+ * `toolCalls` is the projection's field, so it is the normal source. But this
+ * function is also reached with messages that have not been projected — a caller
+ * using `openSession()` directly, a future non-DSH shell — and a raw harness
+ * message keeps its calls inside `content` blocks instead.
+ *
+ * Reading only `toolCalls` made that case catastrophic rather than merely
+ * degraded: the missing calls sent this down the text path, where the rendered
+ * `[tool call: …]` form was then removed by {@link stripLeak} as if it were
+ * leaked markup, leaving an empty message that was dropped entirely. The request
+ * reached the upstream with a `tool` result and no call for it to answer, which
+ * the upstream refuses (`11148 tool calls and tool results do not match`) — a
+ * failure that looks like a broken proxy rather than like a message shape.
+ *
+ * So the blocks are the fallback, and a turn that carries calls always travels as
+ * `tool_calls`.
+ *
+ * @param {{role: string, text: string, toolCalls?: {id: string, name: string, arguments: string}[], toolCallId?: string, content?: unknown}[]} messages
  * @param {'cn' | 'global'} region
  * @returns {object[]}
  */
 export function toWireMessages(messages, region) {
   const { system, rest } = splitSystem(messages);
   const wire = [];
+  /** Call ids already sent on this request; a result may only answer one of them. */
+  const sentCalls = new Set();
   if (system.length > 0) wire.push({ role: 'system', content: system });
   for (const message of rest) {
-    const calls = Array.isArray(message.toolCalls) ? message.toolCalls : [];
+    const calls = callsOf(message);
     // An assistant turn that carries real calls must not also carry the rendered
     // `[tool call: …]` form: the model reads its own history and copies that
     // spelling, producing a burst of pseudo-call text beside the real call.
@@ -487,10 +507,22 @@ export function toWireMessages(messages, region) {
         : messageText(message);
     if (message.role === 'tool') {
       if (text.length === 0) continue;
-      if (typeof message.toolCallId === 'string' && message.toolCallId.length > 0) {
-        wire.push({ role: 'tool', tool_call_id: message.toolCallId, content: text });
+      const answering = typeof message.toolCallId === 'string' ? message.toolCallId : '';
+      if (answering !== '' && sentCalls.has(answering)) {
+        wire.push({ role: 'tool', tool_call_id: answering, content: text });
         continue;
       }
+      // A result whose call is not in this request cannot be expressed on this
+      // wire: the upstream refuses a `tool` message that answers nothing
+      // (`11148`). That shape is reachable — a compaction may keep a result and
+      // drop the turn that asked for it — so the words are kept as a user turn
+      // instead of being dropped or sent as something invalid. The id stays in the
+      // text so the model can still tell two results apart.
+      wire.push({
+        role: 'user',
+        content: answering === '' ? `[tool result]\n${text}` : `[tool result ${answering}]\n${text}`
+      });
+      continue;
     }
     if (message.role === 'assistant' && calls.length > 0) {
       wire.push({
@@ -502,6 +534,7 @@ export function toWireMessages(messages, region) {
           function: { name: call.name, arguments: call.arguments }
         }))
       });
+      for (const call of calls) sentCalls.add(call.id);
       continue;
     }
     if (text.length === 0) continue;
@@ -514,6 +547,21 @@ export function toWireMessages(messages, region) {
   // transport adds one there, so nothing is done about it here.
   void region;
   return wire;
+}
+
+/**
+ * The tool calls one assistant message carries, however it was built.
+ *
+ * The projected `toolCalls` field wins when present. Otherwise the raw harness
+ * shape is read from `content`, which is what an unprojected caller hands over.
+ * See {@link toWireMessages} for what reading only one of them cost.
+ *
+ * @param {{toolCalls?: {id: string, name: string, arguments: string}[], content?: unknown}} message
+ * @returns {{id: string, name: string, arguments: string}[]}
+ */
+function callsOf(message) {
+  if (Array.isArray(message.toolCalls) && message.toolCalls.length > 0) return message.toolCalls;
+  return toolCallsOf(message.content);
 }
 
 /** Parse one SSE payload, or `undefined` when it is not JSON. */

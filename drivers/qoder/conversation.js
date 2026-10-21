@@ -34,7 +34,7 @@ import {
   parseLeakedCalls,
   stripLeak
 } from '../../lib/dsml.js';
-import { flattenConversation, isStraightAppend, messageFingerprint, splitSystem } from '../../lib/messages.js';
+import { appendPrompt, flattenTranscript, isStraightAppend, messageFingerprint, splitSystem } from '../../lib/messages.js';
 
 /**
  * The runtime announces a saturated queue as an ordinary answer, so the opening
@@ -264,7 +264,16 @@ export class QoderConversation {
     }
     await this.#session.reconfigure(options.model, options.effort);
 
-    const prompt = this.#sent.length > 0 && append ? rest[rest.length - 1].text : flattenConversation(rest);
+    // Two ways to tell the child what is new. The append branch sends only the tail —
+    // a question, or the result of a call the child itself just made — and names the
+    // call id so the result is not mistaken for the user speaking. The replay branch
+    // renders the whole conversation **faithfully**, tool exchange included: it runs
+    // when the child has no history it can rely on (fresh, replaced, or a diverged
+    // transcript), and there the calls are the only record that anything ran.
+    const prompt =
+      this.#sent.length > 0 && append
+        ? appendPrompt(rest.slice(this.#sent.length))
+        : flattenTranscript(rest);
 
     const queue = new AsyncQueue();
     const indices = new Map();
