@@ -74,12 +74,22 @@ async function openConversation(logger) {
 }
 
 /**
+ * How long the reusable listing child is kept before it is rebuilt, in ms.
+ *
+ * The catalog itself expires on its own (see `CATALOG_TTL_MS` in `session.js`), so
+ * this is not about freshness — it is about not keeping a worker process alive for
+ * the life of the host. The child's own idle reaper cannot do it: every listing
+ * touches it, and the listing happens on a timer.
+ */
+const CATALOG_SESSION_MAX_AGE_MS = 30 * 60 * 1000;
+
+/**
  * The catalog listing conversation, kept between refreshes.
  *
  * One child, reused: a cold runtime costs seconds to authenticate, and the
  * catalog is re-read on a timer.
  *
- * @type {{conversation: QoderConversation} | undefined}
+ * @type {{conversation: QoderConversation, atMs: number} | undefined}
  */
 let catalogConversation;
 
@@ -133,7 +143,15 @@ export const driver = {
    * clean instead of retrying a wedged one.
    */
   async listModels() {
-    catalogConversation ??= { conversation: await openConversation() };
+    // A listing child that has been up for too long is replaced rather than
+    // reused: it costs one cold handshake, and it bounds what a long-lived child
+    // can accumulate.
+    if (catalogConversation !== undefined && Date.now() - catalogConversation.atMs > CATALOG_SESSION_MAX_AGE_MS) {
+      await closeCatalogConversation();
+    }
+    if (catalogConversation === undefined) {
+      catalogConversation = { conversation: await openConversation(), atMs: Date.now() };
+    }
     try {
       return await catalogConversation.conversation.listModels();
     } catch (error) {

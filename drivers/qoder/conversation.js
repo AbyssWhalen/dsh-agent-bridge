@@ -211,6 +211,8 @@ export class QoderConversation {
    * @param {string} [options.sdkVersion]
    * @param {string} [options.cwd]
    * @param {() => Promise<object>} options.resolveCredential
+   * @param {number} [options.catalogTtlMs] - how long a listing is reused; tests
+   *   pass a small value instead of waiting out the shipped one.
    * @param {{debug?: Function, info?: Function, warn?: Function}} [options.logger]
    */
   constructor(options) {
@@ -220,6 +222,7 @@ export class QoderConversation {
       sdkVersion: options.sdkVersion,
       cwd: options.cwd ?? process.cwd(),
       resolveCredential: options.resolveCredential,
+      catalogTtlMs: options.catalogTtlMs,
       logger: options.logger
     });
   }

@@ -66,6 +66,20 @@ function delay(ms) {
 const IDLE_TEARDOWN_MS = 5 * 60 * 1000;
 
 /**
+ * How long a catalog answer is trusted, in milliseconds.
+ *
+ * Entitlements move while the host runs: a trial ends, a package is added, a
+ * model is retired for the account. Caching the first non-empty answer for the
+ * life of the child meant the plugin kept reporting a roster the account no
+ * longer had — the exact failure that makes this plugin useless, because the
+ * point of it is to serve whatever the account can use *now*.
+ *
+ * So a cached catalog expires. It is a span rather than a count of calls: the
+ * caller asks on its own cadence, and what matters is how old the answer is.
+ */
+const CATALOG_TTL_MS = 5 * 60 * 1000;
+
+/**
  * Reasoning levels the runtime accepts on `--reasoning-effort`, in ascending
  * order. `off` is not a runtime level — it is the absence of one, and the runtime
  * spells that `none` on its control channel and `--thinking disabled` on argv.
@@ -142,8 +156,11 @@ export class QoderSession {
   #idleTimer;
   #startedAt;
   #turn;
-  /** Last catalog the runtime reported, held so a warm session answers instantly. */
+  /** Last catalog the runtime reported, with the instant it was read. */
   #catalog;
+  #catalogAtMs;
+  /** How long a cached catalog is honoured; injectable so a test need not wait. */
+  #catalogTtlMs;
 
   /** Model id currently pinned on the child. */
   model;
@@ -168,6 +185,7 @@ export class QoderSession {
     this.#options = options;
     this.model = options.model;
     this.reasoningEffort = options.reasoningEffort;
+    this.#catalogTtlMs = typeof options.catalogTtlMs === 'number' ? options.catalogTtlMs : CATALOG_TTL_MS;
     this.#start();
   }
 
@@ -296,12 +314,16 @@ export class QoderSession {
     // means a later listing on this session does not need another fetch.
     if (message?.type === 'system' && message.subtype === 'available_models_update') {
       const models = message.models ?? message.data?.models;
-      if (Array.isArray(models) && models.length > 0) this.#catalog = models;
+      if (Array.isArray(models) && models.length > 0) {
+        this.#catalog = models;
+        this.#catalogAtMs = Date.now();
+      }
       return;
     }
 
     this.onEvent(message);
   }
+
 
   /**
    * Answer one child control request.
@@ -417,20 +439,49 @@ export class QoderSession {
    *
    * A genuinely empty account settles on the last answer, which is what hides
    * the provider until the desktop app is signed in.
+   *
+   * A non-empty answer is cached, but only for {@link CATALOG_TTL_MS}: the point
+   * of caching is to keep a warm child answering instantly, not to freeze the
+   * roster. See {@link CATALOG_TTL_MS} for what freezing cost.
    */
   async listModels() {
-    if (this.#catalog !== undefined && this.#catalog.length > 0) return this.#catalog;
+    if (this.#catalogIsFresh()) return this.#catalog;
     for (let attempt = 0; attempt < CATALOG_ATTEMPTS; attempt += 1) {
       const response = await this.#request('get_models', { fetchStrategy: 'live' });
       const models = response?.response?.models;
       if (Array.isArray(models) && models.length > 0) {
-        this.#catalog = models;
+        this.#remember(models);
         return models;
       }
       if (attempt < CATALOG_ATTEMPTS - 1) await delay(CATALOG_RETRY_MS);
     }
     this.#catalog = [];
+    this.#catalogAtMs = undefined;
     return this.#catalog;
+  }
+
+  /**
+   * Whether the cached catalog is still worth honouring.
+   *
+   * An empty answer is never cached: the account may simply not be signed in yet,
+   * and the empty state is what hides the provider, so it has to be re-asked.
+   *
+   * @returns {boolean}
+   */
+  #catalogIsFresh() {
+    if (this.#catalog === undefined || this.#catalog.length === 0) return false;
+    if (this.#catalogAtMs === undefined) return false;
+    return Date.now() - this.#catalogAtMs < this.#catalogTtlMs;
+  }
+
+  /**
+   * Adopt a listing as the cached one, stamped with the instant it was read.
+   *
+   * @param {object[]} models
+   */
+  #remember(models) {
+    this.#catalog = models;
+    this.#catalogAtMs = Date.now();
   }
 
   /** Retarget a live session at another model or effort level. */
