@@ -140,6 +140,68 @@ check('the one-bar call is executed', () => {
   equal(JSON.parse(blocks[0].block.arguments), { command: 'Get-ChildItem' }, 'arguments');
 });
 
+console.log('\n# the letterless delimiter, as a live turn wrote it\n');
+
+/*
+ * Captured from a real DSH agent loop on `qoder/qmodel_38max`: the opening delimiter
+ * arrived as five fullwidth bars with **no** `DSML`, while the `parameter` tags inside
+ * it and the closing tag used the canonical spelling. The whole envelope was therefore
+ * unrecognised — the markup rendered as a wall of bars and, because it was never
+ * parsed as a call, `pwsh` never ran.
+ *
+ * The split points below are chosen to land inside the bare run of bars, which is the
+ * case the tail-holding path has to survive: the driver cannot know yet whether the
+ * bars are a marker or prose, so it must hold them until the tag name arrives.
+ */
+const B5 = (name) => `<｜｜｜｜｜${name}>`;
+const letterless = [
+  M('calls'),
+  `  ${B5('invoke name="pwsh"')}`,
+  `    ${M('parameter name="command" string="true"')}Get-ChildItem -File${CLOSE('parameter')}`,
+  `    ${M('parameter name="description" string="true"')}List .txt files${CLOSE('parameter')}`,
+  `  ${CLOSE('invoke')}`,
+  'List .txt files via PowerShell',
+  CLOSE('calls')
+].join('\n');
+
+const letterlessWarnings = [];
+// Cut three characters into the bare run, so the first frame ends with `<｜｜｜`.
+const letterlessPieces = [
+  'Working.\n',
+  letterless.slice(0, 14),
+  letterless.slice(14, 22),
+  letterless.slice(22),
+  '\nDone.'
+];
+const letterlessChunks = await collect(conversationFor(letterlessPieces, letterlessWarnings));
+const letterlessText = letterlessChunks
+  .filter((chunk) => chunk.type === 'text-delta')
+  .map((chunk) => chunk.text)
+  .join('');
+
+check('no bar-delimited markup reaches the client', () => {
+  if (/DSML/u.test(letterlessText)) throw new Error(`text still has markup: ${JSON.stringify(letterlessText)}`);
+  if (/｜{2,}/u.test(letterlessText)) throw new Error(`bars still in text: ${JSON.stringify(letterlessText)}`);
+  if (/invoke|parameter/u.test(letterlessText)) throw new Error(`tags still in text: ${JSON.stringify(letterlessText)}`);
+});
+
+check('the letterless call is executed, not just cleaned up', () => {
+  const blocks = letterlessChunks.filter((chunk) => chunk.type === 'block-end');
+  if (blocks.length !== 1) throw new Error(`blocks: ${JSON.stringify(blocks)}`);
+  equal(blocks[0].block.name, 'pwsh', 'name');
+  equal(
+    JSON.parse(blocks[0].block.arguments),
+    { command: 'Get-ChildItem -File', description: 'List .txt files' },
+    'arguments'
+  );
+});
+
+check('its prose survives on both sides', () => {
+  equal(letterlessText.includes('Working.'), true, 'leading prose');
+  equal(letterlessText.includes('List .txt files via PowerShell'), true, 'envelope prose');
+  equal(letterlessText.includes('Done.'), true, 'trailing prose');
+});
+
 console.log('\n# ordinary prose is untouched\n');
 
 const plainWarnings = [];

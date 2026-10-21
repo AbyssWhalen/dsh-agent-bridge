@@ -133,6 +133,72 @@ check('ordinary angle brackets release immediately', () => {
   assert(!endsWithMarkerPrefix('List<T>'), 'generic held');
 });
 
+console.log('\n# the letters are dropped entirely\n');
+
+/*
+ * The other degradation, and the worse of the two: a live turn inside a real DSH
+ * agent loop wrote the opening delimiter as five fullwidth bars with **no** `DSML`
+ * at all — `<｜｜｜｜｜invoke name="pwsh">` — while still writing canonical `parameter`
+ * tags and a canonical closing tag in the same envelope.
+ *
+ * The parser required the literal letters, so the envelope was not recognised. Two
+ * things followed: the markup rendered in the transcript as a wall of bars, and
+ * because it was never parsed as a call, **the tool never ran**. The turn was spent
+ * and the user got nothing. Requiring the letters is the mistake; the bars alone are
+ * unambiguous when a tag name follows them.
+ */
+const BARE_OPEN = (name) => `<｜｜｜｜｜${name}>`;
+const BARE_ENVELOPE =
+  '<｜｜DSML｜｜calls>' +
+  `${BARE_OPEN('invoke name="pwsh"')}` +
+  `${OPEN('parameter name="command" string="true"')}Get-ChildItem -File${CLOSE('parameter')}` +
+  `${OPEN('parameter name="description" string="true"')}List .txt files${CLOSE('parameter')}` +
+  `${CLOSE('invoke')}List .txt files via PowerShell`;
+
+check('the letterless delimiter is recognised as call syntax', () => {
+  assert(hasNativeLeak(BARE_OPEN('invoke name="pwsh"')), 'not detected');
+  assert(hasLeak(BARE_ENVELOPE), 'not detected inside the envelope');
+});
+
+check('the call written with it is recovered', () => {
+  const parsed = parseLeakedCalls(BARE_ENVELOPE);
+  equal(parsed.calls.length, 1, 'call count');
+  equal(parsed.calls[0].name, 'pwsh', 'tool name');
+  const args = JSON.parse(parsed.calls[0].arguments);
+  equal(args.command, 'Get-ChildItem -File', 'command');
+  equal(args.description, 'List .txt files', 'description');
+});
+
+check('the prose beside it is kept, and the bars are not', () => {
+  equal(parseLeakedCalls(BARE_ENVELOPE).rest, 'List .txt files via PowerShell', 'rest');
+  equal(stripLeak(BARE_ENVELOPE), 'List .txt files via PowerShell', 'stripped');
+});
+
+check('a letterless delimiter split across deltas is held', () => {
+  for (const tail of ['<｜', '<｜｜', '<｜｜｜', '<｜｜｜｜', '<｜｜｜｜｜', '<｜｜｜｜｜inv', '<｜｜｜｜｜invo']) {
+    assert(endsWithMarkerPrefix(`text ${tail}`), `not held: ${JSON.stringify(tail)}`);
+  }
+});
+
+/*
+ * The guard that makes the letterless form safe to accept. A run of bars on its own
+ * is ordinary in shell pipelines, C operators and diagrams; treating every `<||` as
+ * the start of a call would hold text that never had a call in it, and `stripLeak`
+ * would then delete the bars from replayed history.
+ */
+check('a run of bars in prose is not a call', () => {
+  for (const prose of ['a <|| b', 'x <| y', 'pipe <||> operator', 'if (a < |b|) {}', 'a <||||||| b']) {
+    assert(!hasNativeLeak(prose), `treated as a call: ${JSON.stringify(prose)}`);
+    equal(stripLeak(prose), prose, `mangled: ${JSON.stringify(prose)}`);
+  }
+});
+
+check('a tag name after the bars is what makes it a call', () => {
+  assert(hasNativeLeak('<｜｜｜｜｜invoke name="x">'), 'letterless invoke not detected');
+  assert(hasNativeLeak('<||||||parameter name="x">'), 'letterless parameter not detected');
+  assert(!hasNativeLeak('<||||||invoked'), 'a longer word is not the tag');
+});
+
 console.log('');
 if (failures > 0) {
   console.log(`# dsml-variant: ${failures} check(s) failed`);
