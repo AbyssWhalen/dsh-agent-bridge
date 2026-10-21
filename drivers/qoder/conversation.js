@@ -30,6 +30,7 @@ import {
   endsWithMarkerPrefix,
   hasLeak,
   hasNativeLeak,
+  isDegenerate,
   MARKER_MAX,
   parseLeakedCalls,
   stripLeak
@@ -405,6 +406,16 @@ export class QoderConversation {
         pendingText = '';
         return;
       }
+      // A repetition loop, not prose. Live captures contain runs of five hundred
+      // fullwidth bars with no call in them at all — the model repeating one token until
+      // it runs out of budget. Holding is what stops half a thousand bars reaching the
+      // screen; what happens to them afterwards is decided in `settleText`.
+      if (isDegenerate(pendingText)) {
+        holding = true;
+        heldText = pendingText;
+        pendingText = '';
+        return;
+      }
       const keep = endsWithMarkerPrefix(pendingText) ? MARKER_MAX : 0;
       const release = keep === 0 ? pendingText.length : Math.max(0, pendingText.length - keep);
       if (release === 0) return;
@@ -425,6 +436,10 @@ export class QoderConversation {
           holding = true;
           heldText = pendingText;
           pendingText = '';
+        } else if (isDegenerate(pendingText)) {
+          holding = true;
+          heldText = pendingText;
+          pendingText = '';
         } else {
           emitText(pendingText, 0);
           pendingText = '';
@@ -432,12 +447,28 @@ export class QoderConversation {
         }
       }
       if (!holding) return;
-      const recovered = parseLeakedCalls(heldText);
+      const raw = heldText;
+      const recovered = parseLeakedCalls(raw);
+      const degenerate = recovered.degenerate;
       heldText = '';
       holding = false;
       if (recovered.calls.length === 0) {
+        // A repetition loop is not a turn that said nothing — it is a turn that produced
+        // nothing usable, and showing the bars would let it look like an answer. Failing
+        // is the only outcome a user can act on: the reason names the cause, and the
+        // conversation is not poisoned with markup that the next turn would imitate.
+        if (degenerate) {
+          queue.fail(new Error('qoder: the model degenerated into a repetition loop and produced no answer; retry the turn'));
+          return;
+        }
+        // A block that was call syntax but could not be read is shown **as written**.
+        // The intent here was always "showing the markup it was written in beats swallowing
+        // a turn", but the text emitted used to be `recovered.rest` — the block with its
+        // tags stripped out. That leaves the argument values behind as ordinary prose,
+        // which reads as the model babbling and hides the only clue that anything went
+        // wrong. The raw block at least says what it was trying to do.
         this.#logger?.warn?.('qoder: the model wrote call syntax as text and it could not be recovered');
-        emitText(recovered.rest, 0);
+        emitText(raw, 0);
         return;
       }
       for (const call of recovered.calls) emitCall(call);
