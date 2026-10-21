@@ -35,7 +35,7 @@
  */
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mintJobToken } from './upstream.js';
@@ -161,6 +161,8 @@ export class QoderSession {
   #catalogAtMs;
   /** How long a cached catalog is honoured; injectable so a test need not wait. */
   #catalogTtlMs;
+  /** Where raw frames are appended, from `DSH_BRIDGE_DUMP_FRAMES`. */
+  #dumpPath;
 
   /** Model id currently pinned on the child. */
   model;
@@ -186,6 +188,8 @@ export class QoderSession {
     this.model = options.model;
     this.reasoningEffort = options.reasoningEffort;
     this.#catalogTtlMs = typeof options.catalogTtlMs === 'number' ? options.catalogTtlMs : CATALOG_TTL_MS;
+    const dump = process.env.DSH_BRIDGE_DUMP_FRAMES;
+    this.#dumpPath = typeof dump === 'string' && dump.length > 0 ? dump : undefined;
     this.#start();
   }
 
@@ -289,6 +293,7 @@ export class QoderSession {
   /** Route one decoded worker message. */
   #dispatch(message) {
     this.#touchIdle();
+    this.#dump(message);
 
     if (message?.type === 'control_request') {
       void this.#answerControl(message);
@@ -324,6 +329,29 @@ export class QoderSession {
     this.onEvent(message);
   }
 
+  /**
+   * Append one raw frame to `DSH_BRIDGE_DUMP_FRAMES`, when that is set.
+   *
+   * A driver that translates a vendor's protocol is only as good as the frames it
+   * was written against, and reasoning about Those from a rendered answer is
+   * guesswork: the difference between "the model wrote a call we failed to parse"
+   * and "the model wrote prose that looks like a call" is one field apart, and the
+   * rendered text has already lost which channel it arrived on.
+   *
+   * So this records what arrived, verbatim, and nothing else — the file is the
+   * vendor's own bytes. Off unless asked for, because it can carry prompt text.
+   *
+   * @param {unknown} message
+   */
+  #dump(message) {
+    if (this.#dumpPath === undefined) return;
+    try {
+      appendFileSync(this.#dumpPath, `${JSON.stringify(message)}\n`);
+    } catch {
+      // A diagnostic that breaks the turn it is diagnosing is not worth having.
+      this.#dumpPath = undefined;
+    }
+  }
 
   /**
    * Answer one child control request.

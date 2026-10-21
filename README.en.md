@@ -145,6 +145,14 @@ Per-driver probes: `node test/integration/leak.mjs qoder` (child process after l
 
 Measured records: [docs/verification.md](docs/verification.md).
 
+### Verifying inside a real DSH agent loop
+
+Everything above drives the drivers directly. **Whether tools work in a real loop can only be proven in a real loop** — that is the only place where DSH's system prompt pushes the model to call a tool at all. Setup (isolated `DSH_HOME` plus a headless profile), the two-part pass condition (the tool actually ran **and** no call markup leaked), and a troubleshooting table: [docs/real-loop.md](docs/real-loop.md).
+
+```powershell
+pwsh -File tools/real-loop-check.ps1 -Profile e2e -Runs 5 -Provider qoder
+```
+
 
 ## Layout
 

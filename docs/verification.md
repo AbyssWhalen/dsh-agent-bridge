@@ -96,20 +96,27 @@ node test/tools-live.mjs               # 实机：真账号 + 真上游 + 本插
 
 `test/tools.mjs` 用合成 SSE 钉住四条：适配器把 harness 的 `{name, description, parameters}` 转给驱动；驱动再转成 OpenAI 的 `function` 信封；一串参数片段重组成 `block-start` / `tool-call-delta` / `block-end`，`finish` 报 `tool-calls`；历史里的调用带 `tool_calls`、结果按 `tool_call_id` 对应。有工具时还必须**不再**注入「你没有工具」的前导语——那和工具列表直接矛盾，模型会退回去写文本调用。
 
-实机一次的结果：
+实机一次的结果（两轮闭环，`WorkBuddy tools driver: OK`）：
 
 ```
-chunk types : block-start, tool-call-delta, block-end, usage, finish
-block-start : 1 ["tool-call"]
-deltas      : 65
-block-end   : 1
-finish      : {"kind":"tool-calls"}
-text        : (none — the turn is a call)
-  call      : pwsh {"command": "Get-ChildItem | Select-Object Mode, Length, LastWriteTime, Name | Format-Table -AutoSize"}
-WorkBuddy tool channel: OK
+turn 1 (expect a pwsh call)
+  chunk types : block-start, tool-call-delta, block-end, usage, finish
+  block-start : 1 ["tool-call"]
+  deltas      : 25
+  block-end   : 1
+  finish      : {"kind":"tool-calls"}
+  text        : (none)
+  call        : pwsh {"command": "Get-ChildItem"}
+
+turn 2 (expect prose about the listing)
+  chunk types : reasoning-delta, text-delta, usage, finish
+  finish      : {"kind":"stop"}
+  text        : "The current directory contains two files:\n\n- `README.md`\n- `package.json`…"
 ```
 
-65 个片段拼回的参数是合法 JSON，说明「id/name 先到、参数在后」的顺序被上游真的这么发，也说明重组是按 `index` 而不是按到达顺序做的。
+25 个片段拼回的参数是合法 JSON，说明「id/name 先到、参数在后」的顺序被上游真的这么发，也说明重组是按 `index` 而不是按到达顺序做的。
+
+**第二轮才是重点。** 只测一轮只能验到「模型发起了调用」，验不到「结果喂回去之后模型还能答」——而这一路出过真问题：助手那一轮如果丢了 `tool_calls`，剩下的 `tool` 消息就在回答一个不存在的调用，上游直接 `11148 tool calls and tool results do not match`。所以现在第二轮把 `tool-call` 块和 `tool` 消息按 harness 的真实形状回放，要求 `finish: stop` 且**有正文**。
 
 ## 四、逐驱动实盘
 
@@ -120,9 +127,11 @@ node test/workbuddy-live.mjs
 
 每个脚本独立跑一家：安装状态 → 模型数 → 额度 → 两轮真实对话，最后打印一行 `<厂商> driver: OK`（方便整套跑完 grep 一遍）。这个「一定有一行结论」是**进程级保证**，不是 happy path 末尾的一句 `console.log`：`test/verdict.mjs` 接管 `unhandledRejection` / `uncaughtException`，所以失败也会给出结论行而不是裸栈。
 
+`qoder-live.mjs` 末尾还有一轮**故意失败**：用一个账号里没有的模型发一轮，断言它必须响。只测成功路径的话，`F-006`（队列把中途失败当成正常结束）和 `F-007`（失败的帧判成空回复）在它面前完全隐形——两个缺陷的表现都是「正常结束 + 零文本」，和模型不肯回答分不出来。允许抛异常或 `finish.reason` 为 `error`，唯独不允许静默收场。
+
 | 驱动 | 结果（快照） |
 | --- | --- |
-| Qoder | 14 个模型 · `2,794 credits left` · PONG / PING |
+| Qoder | 14 个模型 · `2,794 credits left` · PONG / PING · 故意失败轮 `qoder: Sorry, something went wrong…` |
 | WorkBuddy | 18 个模型 · `6,402 积分` · PONG / PING |
 
 ## 五、真 DSH 跑通
@@ -135,6 +144,8 @@ node test/workbuddy-live.mjs
 | `workbuddy` / `deepseek-v4.1-flash` | `PONG`，`turn_end: completed` |
 
 这两行意味着整条链路是通的：DSH 按命名空间找到 provider → 走本插件的 adapter → 驱动去跟客户端说话 → 流式结果回到会话里。
+
+**但这只证明了「有回复」。** 工具在真循环里能不能用，另见第十节——那里补了工具闭环，并因此抓出第八条缺陷。
 
 ## 六、思考强度：实机怎么验的
 
@@ -162,6 +173,8 @@ Qoder 的档位不是读文档读出来的，是一条条问出来的。同一�
 **一、前言与上游系统提示打架。** 第一次跑某个自带 agent 系统提示的上游时，一个「只回一个词」的请求产生了 **878 个输出 token** 的思考——模型在纠结「我们的 proxy 前言说我没有工具，但上游自己的系统提示说我有工具，这段前言是不是注入攻击」。改法不是改措辞，是把「要不要加前言」变成驱动契约的一部分（`ownSystemPrompt`）。改完同一轮降到 **3 个输出 token**，直接回答。
 
 **二、模型列表会「冻住」。** 有个上游的模型列表来自一次会话创建时的快照，而 catalog 会话长期热着，于是旧列表被一直重复报下去——「额度到了但插件还报旧列表」正好会毁掉加它的目的。修法是给 catalog 会话 5 分钟回收。
+
+> 这一条当时只写进了文档，代码里没落地：`listModels()` 仍然只看 `#catalog` 是否非空，而 catalog 每 5 分钟刷新一次、每次都 `#touchIdle()`，所以子进程永不闲置、永不回收。见第九节。
 
 **三、`isReasoning` 两个方向都错。** 它漏掉 DeepSeek-Flash / Kimi-K3，又给 `auto` / `q37fmodel` 编出并不存在的控件；而真正的权威是 `thinking_config`。修完之后 Qoder 14 个模型里 10 个有真档位、2 个只有开/关、3 个没有控件，与 Qoder 自己的 UI 对得上。
 
@@ -203,3 +216,156 @@ Qoder 的档位不是读文档读出来的，是一条条问出来的。同一�
 - `qoder-*.mjs`：协议探测（控制帧、`thinking_config`、`off` 与 `low` 的实际差异）。
 
 README 里的三张图就是 `render-html.mjs` 的输出（**本地桩数据渲染，只示版式**）。
+
+## 九、第二轮实测补修（未发版）
+
+这一轮用真账号把两个驱动重新跑了一遍，并专门去撞「取消」「失败」「缓存」这三类平时不会主动碰的路径。七条里前四条是行为错误，后三条里第六、七条会让用户看到**假的成功**。
+
+**一、模型列表仍然冻住（第七节第二条其实没修）。** `QoderSession.listModels()` 只看 `#catalog` 是否非空，`#catalog` 从不失效；`catalogConversation` 只在抛错时关闭，而会话的 idle reaper 被每 5 分钟一次的刷新反复重置。探针连问两次得到**同一个数组对象**，说明一次上游都没问。修法是把「新鲜度」做进 `QoderSession`：`CATALOG_TTL_MS`（5 分钟，可注入以便测试），过期才 `get_models`；空列表不缓存（那正是未登录时隐藏 provider 的机制）。驱动侧再加一条 30 分钟上限，把常驻的 listing 子进程换掉。`test/catalog-ttl.mjs` 用一个「每次列表都多一个模型」的替身 runtime 钉住这两件事。
+
+**二、用户按「停止」被上报成上游服务端错误。** 取消一轮对话时，客户端拿到的是
+`the upstream rejected the request (server, http 0): transport error: AbortError`——话说反了，而且 `kind: server` 属于「可重试」分类，被取消的请求可能被重发；`http 0` 还是驱动程序编出来的状态码。修法是 `chatStream()` 先认 `signal.aborted` / `AbortError`，报 `kind: 'cancelled'`，并让 `describeFailure()` 说「the request was cancelled」。请求阶段与读流阶段两条路都覆盖，`test/cancellation.mjs` 用替换 `fetch` 的方式离线钉住，真实网络故障仍归 `server`。
+
+**三、驱动层会静默吞掉「未投影」的工具调用。** 把 harness 原始形状的消息（`content` 里带 `tool-call` 块）直接交给 `openSession().send()`，助手那一轮**整条从请求里消失**：先读不到 `toolCalls` 而退化成文本，紧接着那段 `[tool call: …]` 又被 `stripLeak()` 当作自家渲染的伪调用清掉，于是空文本、被 `continue` 丢弃。请求到了上游只剩一个没有调用可答的 `tool` 消息，上游回 `11148 tool calls and tool results do not match`。真实 DSH 链路因为 `adapter.js` 先投影而没暴露，但驱动契约不该只在这种前提下成立——现在两种形状都读，`test/wire-shapes.mjs` 同时钉住。
+
+**四、孤立的工具结果仍会被发出去。** 上下文压缩可能留下结果、丢掉提问的那一轮，而上游拒绝「没有对应调用」的 `tool` 消息。现在这种结果降级成一条 user 文本（保留 id 与内容），不再让整轮 400。
+
+**五、已取消的一轮仍然把 prompt 发给了 worker。** 「把队列置为失败」写在 `session.send(prompt)` 之前，可 prompt 照样发了出去——取消了却照样扣额度，还让子进程的历史比这个类记的多一轮，下一轮的 append 判定随之失准。现在先查 `signal.aborted` 再发；同时取消统一成 `AbortError`，和第二节同一套语义。
+
+**六、Qoder 的队列把中途失败当成正常结束（本轮最严重）。** `AsyncQueue` 的等待者只存了 resolve，`fail()` 唤醒它们时给的是 `{ done: true }`——读作「这一轮正常结束了」。而流式期间几乎总有等待者停在那儿，所以这不是边角情况，而是**所有中途错误的默认路径**：上游报错、取消、worker 猝死，全部变成一条被截断的回答，没有异常、没有日志。修法是等待者同时存 reject。
+
+**七、失败的帧被判成空回复。** 用一个账号里没有的模型发一轮，拿到的 `result` 帧是
+`{ subtype: "error_during_execution", is_error: true, errors: ["Sorry, something went wrong…"] }`——**没有 `result` 字段**。旧判断要求 `result` 非空才算失败，于是它被当成正常结束：`finish: stop`、零文本、零错误，从外面看就是模型不肯回答。现在失败以帧自己的判词为准（`is_error` 或 `subtype`），原因按 `result` → `errors[]` → `subtype` 三级取。`test/qoder-failure-frames.mjs` 用能按需发帧的替身 runtime 钉住四种形状；实盘复验同一请求已从「空回复」变成
+`qoder: Sorry, something went wrong. Please try again. Report Issue (input /feedback)`。
+
+这一轮新增的探针在 `_probe/`：`abort-phases.mjs`（取消的两个阶段）、`tools-loop-live.mjs` 与 `tools-loop-dsh.mjs`（未投影 / 已投影两种消息形状下的工具闭环）、`tools-wire-dump.mjs`（把真实请求体打出来）、`qoder-catalog-freeze.mjs` 与 `qoder-catalog-ttl.mjs`、`qoder-cancel` 相关的两个、`qoder-frames-live.mjs`（原始帧）、`qoder-error-live.mjs`。
+
+## 十、真 DSH 循环里的工具闭环，以及第八条缺陷
+
+第五节只验到「一轮对话有回复」。**有回复不等于工具能用**，而工具通道的问题恰好只在真 agent 循环里出现——只有那里，系统提示才会推着模型去发起工具调用。补上这一段之后又抓出一条。
+
+### 怎么搭的
+
+桌面端正在用的那个实例（`127.0.0.1:19387`）不加载本插件，`/plugins/dsh-agent-bridge/status` 是 404，所以不能拿它测得。改用一个**完全隔离的 `DSH_HOME`**，不动桌面端的 profile：
+
+```powershell
+$env:DSH_HOME = '<隔离目录>'
+node <dsh>/lib/bin.js --profile e2e --from-default-profile headless --dump-config
+```
+
+把插件拷进 `<DSH_HOME>/profiles/e2e/plugins/dsh-agent-bridge`，在 profile 的 `package.json` 里加 `"dsh-agent-bridge": "file:./plugins/dsh-agent-bridge"` 并把它列进 `dsh.profile.bundles`。`--dump-config` 出现 `agent-bridge-workbuddy` / `agent-bridge-qoder` 两行，就说明插件被真的组装进去了。
+
+用 `--patch` 叠加一层只改 `agent-default-model` 的 overlay，同一个 profile 就能分别指向两家，不必来回改文件。然后：
+
+```powershell
+node <dsh>/lib/bin.js --profile e2e --patch <overlay> headless "用 pwsh 工具列出当前目录的文件"
+```
+
+### 判据：不只看「有没有泄漏」
+
+跑一个只有一句 prompt 的回合是不够的。缺陷的表现是**标记渲染出来、工具却没执行**，两者可以独立发生——所以每轮种一个**文件名带随机 token** 的文件，只有 token 出现在回答里才算工具真的跑过；同时回答里不许出现 `invoke` / `parameter name=` / 连续竖线。两条都满足才算通过。
+
+`tools/real-loop-check.ps1` 把这件事做成了脚本：
+
+```powershell
+pwsh -File tools/real-loop-check.ps1 -Profile e2e -Runs 5 -Provider qoder
+pwsh -File tools/real-loop-check.ps1 -Profile e2e -Runs 5 -Provider workbuddy -Model deepseek-v4.1-flash
+```
+
+修复后实测：`qoder` 4/4、`workbuddy` 3/3，工具都真的执行、零泄漏。
+
+### 第八条：模型把分隔符写成「只有竖线、没有 `DSML`」
+
+真循环里跑出来的原文（`qoder` / `qmodel_38max`，原始帧确认）：
+
+```
+<｜｜DSML｜｜calls>
+<｜｜｜｜｜invoke name="pwsh">          ← 五个竖线，没有 DSML
+<｜｜DSML｜｜parameter name="command" string="true">Get-ChildItem -File -Filter *.txt</｜｜DSML｜｜parameter>
+</｜｜DSML｜｜invoke>List .txt files via PowerShell
+```
+
+同一个信封里，`invoke` 用退化写法、`parameter` 用规范写法。解析器要求字面 `DSML`，于是**整个信封都不被识别**——标记进入回答、`pwsh` 从未执行，这一轮就白花了。
+
+修法：分隔符拆成两种拼法，字母有的、和只有竖线的。只承认竖线的那个**必须后跟标签名**（`invoke` / `parameter` / `calls` / `tool_calls`）——否则 shell 管道里的 `<||` 会被当成调用开头，把正常文本扣住再从历史里删掉。`endsWithMarkerPrefix()` 也一并改成按归一化后的尾巴判断，不再列举已知拼法（列不完，模型版本一变就落后）。
+
+护栏：`test/dsml-variant.mjs` 用抓到的字节钉住解析，`test/dsml-stream.mjs` 从**驱动输出**再钉一次（含「切在裸竖线中间」的流行边界）。反向验过：把裸分隔符分支关掉，四条断言全红，报的症状和实际泄漏一致。
+
+探针：`_probe/dsml-bare-delimiter.mjs`（抓到的字节 + 散文误判边界）、`_probe/qoder-marker-leak.mjs`（直接采样驱动发出的 chunk，而不是厂商原始帧——帧里永远有标记，那是模型写的内容）、`_probe/inspect-frames.mjs`（把帧里的标记逐码点打出来，终端是有损视图）。
+
+### 这一轮顺带补的
+
+- `test/tools-live.mjs` 原来只测一轮，只验到「模型发起了调用」，验不到「调用结果喂回去之后模型还能答」——而 F-003 暴露的正是后半段。现在扩成两轮闭环（`finish: tool-calls` → 回放 `tool-call` + `tool` → `finish: stop` 且有正文）。
+- `test/qoder-live.mjs` 原来只测成功路径，`F-006`/`F-007` 在它面前是隐形的。现在末尾加一轮**故意失败**（用一个账号里没有的模型），断言失败必须**响**：要么抛异常、要么 `finish.reason` 是 `error`；唯一不允许的是「正常结束 + 零文本」，那和模型不肯回答分不出来。实盘已从静默空回复变成 `qoder: Sorry, something went wrong…`。
+- `drivers/qoder/session.js` 加了 `DSH_BRIDGE_DUMP_FRAMES` 环境变量：置为一个文件路径就把收到的每一帧原样追加进去。翻译协议的人只有一份渲染后的回答可看时只能猜，而「模型写了我们没解析出来的调用」和「模型写了看起来像调用的散文」只差一个字段，渲染早就把是哪个通道丢了。默认关闭，因为它会带上 prompt 原文。
+
+## 十一、第九条缺陷：历史重放丢掉了发起调用的那一轮
+
+第八条修完之后去量「每次请求到底送了多少字节」，顺手把两个记在案上的疑问（H-001 / H-003）一起量了。H-001 不成立，H-003 的前提是错的，但量出了一个更严重的东西。
+
+### 两个疑问的结论
+
+**H-001（前导语与工具说明矛盾）：不成立。** `DriverAdapter.stream()` 在调用方给了工具时**不注入** `PROXY_PREAMBLE`，而 `toolPreamble()` 只在有工具时拼进 framing —— 两者互斥，不可能同时出现在一份 system 里。实测真循环里的 framing 是 676 字节，含 `# Calling tools`，不含 `You have no tools`。`test/tools.mjs` 早就在钉这件事。
+
+**H-003（工具循环重建历史导致 token 翻倍）：前提错了。** `flattenConversation()` 会**丢掉最后一个 user 轮之后的所有消息**，所以「重放」并不重发整段历史。实测：三次工具交换里标着 REPLAY 的几轮都是 117 字节，全等，不增长。
+
+### 但那个截断本身是错的
+
+它丢掉的是**发起调用的那一轮**。对一个**有历史**的子进程这没关系——调用是它自己写的，结果补上就行。对一个**没有历史**的子进程（刚起、或崩了被换掉）就不是了，它收到的是：
+
+```
+[Conversation so far]
+User: List the files in C:\missing-folder using the pwsh tool.
+[End of conversation so far]
+
+Get-ChildItem : Cannot find path 'C:\missing-folder' because it does not exist.
+```
+
+工具名、call id、以及「这是输出」这件事全没了。读起来就是**用户在报一个路径问题**。模型于是把命令输出当成用户提供的信息，不再当工具结果看。
+
+同时，`isStraightAppend()` 当时要求新增的尾巴**必须以 user 结尾**，所以回答工具结果的那一轮**永远走重放**——也就是说每一次工具交换都会经过这条会丢调用的路。
+
+### 修法
+
+拆成两件事，各自由谁来做很清楚：
+
+| 场景 | 用什么 | 送出什么 |
+| --- | --- | --- |
+| 子进程已有历史，只差一条新消息 | `appendPrompt()` | `Tool result for <call id>:\n<输出>` —— 只这一条 |
+| 子进程没有可用历史（新起/被换/历史分叉） | `flattenTranscript()` | 整段，**含** `[tool call: 名 {参数} (id …)]` 与 `Tool result for <id>:` |
+
+`isStraightAppend()` 放宽为「尾巴可以以 user 或 tool 结尾」，中间仍不许出现第二个 user 轮。这样回答工具结果的那一轮不再重建历史，顺带把每次交换的请求量从 117 字节降到 68 字节。
+
+### 实测
+
+量出来的形状（`_probe/qoder-framing-cost.mjs`）：
+
+```
+修前  turn 1:  20 bytes append
+      turn 2: 117 bytes REPLAY  "[Conversation so far]\nUser: …\n[End]…\nalpha.txt…"
+      turn 3: 117 bytes REPLAY
+      turn 4: 117 bytes REPLAY
+      冷子进程收到 tool 结果 → 不含工具名（names the tool call: false）
+
+修后  turn 1:  20 bytes append  "List the files here."
+      turn 2:  68 bytes append  "Tool result for qoder_call_0:\nalpha.txt…"
+      turn 3:  68 bytes append
+      turn 4:  68 bytes append
+      冷子进程 → "[tool call: pwsh {…} (id call_1)] … Tool result for call_1:"（true）
+```
+
+真账号验证两件事：
+
+- **追加路径**（`_probe/qoder-append-live.mjs`）：三次交换，每轮结果里塞一个随机 token，最后一次要求模型原样报出**两个** token。两个都出来 → 说明「调用→结果→再调用→结果→正文」这条链是通的。顺带看到耗时从首轮 11.7s 降到 3.2s / 3.3s（不再重放）。
+- **冷子进程**（`_probe/qoder-cold-result-live.mjs`）：全新会话直接给一个**失败命令**的输出。修后模型答「The command returned the following error: …」——把输出归给命令；被截断的版本做不到这个读法。
+
+### 护栏
+
+`test/replay-shape.mjs`（进 `npm test`）钉住 4 组字节事实：冷子进程的 prompt 必须含 call 名与 id、结果必须标 id；已有历史时必须是 append 且 < 200 字节、不许回显调用；单条 user 要裸发不加壳；历史分叉时必须整段重放且含调用。另有一组 `isStraightAppend` 的边界（tool 尾可追加、中间有 user 不可追加、前缀变了不可追加）。
+
+反向验证两条都做：把 tool 尾的可追加性去掉 → 4 条红（退回旧重放行为）；把 `flattenTranscript` 换回截断 → 4 条红（调用与 id 消失）。`_probe/replay-truncation-counterfactual.mjs` 自动做后者并还原源码。
+
+### 没改的
+
+- `flattenConversation()` 本身留着。它「把最后的 user 轮重复一遍」的行为对无状态驱动是对的，`workbuddy` 只在兜底路径用它。改它风险大于收益。
+- 首次请求仍是裸文本（20 字节），不是带壳的 transcript —— 全新子进程没有任何前文可讲，加壳反而告诉它「前面有内容」。

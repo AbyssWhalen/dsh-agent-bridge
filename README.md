@@ -149,6 +149,14 @@ npm run test:live       # 实机：两家各跑模型数 / 额度 / 两轮真对
 
 实测记录见 [docs/verification.md](docs/verification.md)。
 
+### 在真 DSH agent 循环里验
+
+上面所有测试都是驱动直连。**工具在真循环里能不能用，只有真循环能证明**——只有那里，DSH 的系统提示才会推着模型去发起工具调用。搭法（隔离 `DSH_HOME` + headless profile）、判据（工具真执行 **且** 无标记泄漏，两条缺一不可）、排查表见 [docs/real-loop.md](docs/real-loop.md)：
+
+```powershell
+pwsh -File tools/real-loop-check.ps1 -Profile e2e -Runs 5 -Provider qoder
+```
+
 
 ## 目录
 
