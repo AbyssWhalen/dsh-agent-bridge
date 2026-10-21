@@ -19,6 +19,7 @@
  */
 import { endsWithMarkerPrefix, hasLeak, hasNativeLeak, MARKER_MAX, parseLeakedCalls, stripLeak } from '../../lib/dsml.js';
 import { assistantProse, flattenConversation, messageText, splitSystem } from '../../lib/messages.js';
+import { UpstreamFailure } from './upstream.js';
 
 /** How long a stream may go without a frame before it is considered stalled. */
 export const STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
@@ -392,7 +393,20 @@ export class WorkBuddyConversation {
         closeCalls();
         queue.close();
       } catch (error) {
-        if (!stalled) queue.fail(error instanceof Error ? error : new Error(String(error)));
+        if (!stalled) {
+          // A cancellation that lands mid-stream arrives here rather than at the
+          // request, because the response was already open. It is reported the
+          // same way the request path reports it, so one cancellation always looks
+          // like one thing.
+          const cancellation = signal?.aborted === true;
+          queue.fail(
+            cancellation
+              ? new UpstreamFailure('cancelled', 0, 'the caller cancelled the request')
+              : error instanceof Error
+                ? error
+                : new Error(String(error))
+          );
+        }
       }
     })();
 

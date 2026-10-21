@@ -604,6 +604,12 @@ export function describeFailure(kind, status, detail) {
   if (kind === 'hard_credit') {
     return `workbuddy: the account is out of credit${fallback === undefined ? '' : ` — ${fallback}`}`;
   }
+  if (kind === 'cancelled') {
+    // Nothing to act on: the caller stopped this turn on purpose. Reporting it as
+    // an upstream fault would send the user looking for a problem that is not
+    // there, and would invite a retry of work they just cancelled.
+    return 'workbuddy: the request was cancelled';
+  }
   if (kind === 'session_dead') {
     return 'workbuddy: the stored sign-in is no longer valid — sign in again in the WorkBuddy app';
   }
@@ -647,6 +653,27 @@ function readQueue(detail) {
  */
 function readRetryAfter(detail) {
   return readQueue(detail)?.retryAfterSec;
+}
+
+/**
+ * Whether a thrown transport error is the caller's own cancellation.
+ *
+ * `fetch` reports an abort as a `DOMException` named `AbortError` (or as whatever
+ * the platform's `AbortSignal` produced), and the caller's own signal is the
+ * authority: it is aborted exactly when that caller cancelled. Both are checked
+ * because a driver is also reached from tests and scripts whose signal may be a
+ * bare `AbortController` that already fired.
+ *
+ * @param {unknown} error
+ * @param {AbortSignal} [signal]
+ * @returns {boolean}
+ */
+function isCancellation(error, signal) {
+  if (signal?.aborted === true) return true;
+  const name = /** @type {{name?: unknown}} */ (error)?.name;
+  if (name === 'AbortError' || name === 'TimeoutError') return true;
+  const code = /** @type {{code?: unknown}} */ (error)?.code;
+  return code === 'ABORT_ERR';
 }
 
 /**
@@ -703,6 +730,13 @@ export class UpstreamClient {
         ...(signal === undefined ? {} : { signal })
       });
     } catch (error) {
+      // A caller who pressed stop did not hit an upstream fault, and reporting one
+      // is not a cosmetic problem: `kind` decides whether the harness retries, so
+      // a cancellation classified as `server` can be re-sent. The cancellation is
+      // rethrown as the abort it is, with no invented status code.
+      if (isCancellation(error, signal)) {
+        throw new UpstreamFailure('cancelled', 0, 'the caller cancelled the request');
+      }
       throw new UpstreamFailure('server', 0, `transport error: ${String(error)}`);
     }
     if (response.ok) return response;

@@ -136,6 +136,19 @@ export function toolPreamble(tools) {
  * The child's events arrive as callbacks while the harness pulls chunks, so
  * something has to sit between them. A queue rather than a promise chain because
  * one turn produces many chunks in burst order, and ordering is the whole point.
+ *
+ * ## A failure must wake the reader with a failure
+ *
+ * A waiter is stored as a resolver *and* a rejecter. The first version stored only
+ * the resolver and answered `{ done: true }` on `fail()`, which read as "the turn
+ * ended normally" — and since a streaming turn has a waiter parked almost all the
+ * time, that was not an edge case but the normal path for every mid-turn fault:
+ * an upstream error, a cancellation, a worker that died. The turn then closed as if
+ * it had simply finished, so the caller saw a short answer instead of an error, and
+ * nothing anywhere reported what happened.
+ *
+ * `next()` still checks the recorded error before the closed flag, so a consumer
+ * that arrives after the failure also sees the failure.
  */
 class AsyncQueue {
   #items = [];
@@ -147,7 +160,7 @@ class AsyncQueue {
     if (this.#closed) return;
     const waiter = this.#waiters.shift();
     if (waiter !== undefined) {
-      waiter({ done: false, value: item });
+      waiter.resolve({ done: false, value: item });
       return;
     }
     this.#items.push(item);
@@ -157,13 +170,13 @@ class AsyncQueue {
     if (this.#closed) return;
     this.#error = error;
     this.#closed = true;
-    for (const waiter of this.#waiters.splice(0)) waiter({ done: true });
+    for (const waiter of this.#waiters.splice(0)) waiter.reject(error);
   }
 
   close() {
     if (this.#closed) return;
     this.#closed = true;
-    for (const waiter of this.#waiters.splice(0)) waiter({ done: true });
+    for (const waiter of this.#waiters.splice(0)) waiter.resolve({ done: true });
   }
 
   /** The next chunk, or `{done: true}` once the turn ends. */
@@ -172,7 +185,7 @@ class AsyncQueue {
     if (item !== undefined) return Promise.resolve({ done: false, value: item });
     if (this.#error !== undefined) return Promise.reject(this.#error);
     if (this.#closed) return Promise.resolve({ done: true });
-    return new Promise((resolve) => this.#waiters.push(resolve));
+    return new Promise((resolve, reject) => this.#waiters.push({ resolve, reject }));
   }
 }
 
@@ -460,13 +473,23 @@ export class QoderConversation {
       }
       if (message?.type === 'result') {
         session.endTurn();
-        const failed = message.is_error === true && String(message.result ?? '').length > 0;
+        // Whether the turn failed is the frame's own verdict, not the consequence of
+        // it carrying a message. The runtime reports a failure in two shapes: a
+        // `result` string, and — as it does for a model the account does not have —
+        // an `errors` array with no `result` field at all. Reading only `result`
+        // made the second shape look like a clean end, so the caller received a
+        // turn that finished as `stop` with no text: an empty reply, no error, and
+        // nothing in any log. That is indistinguishable from a refusal, which is
+        // the worst thing an empty answer can be.
+        const failed =
+          message.is_error === true || (typeof message.subtype === 'string' && message.subtype !== 'success');
+        const detail = failureDetail(message);
         if (failed && !delivered()) {
-          queue.fail(new Error(`qoder: ${String(message.result).slice(0, 400)}`));
+          queue.fail(new Error(`qoder: ${detail}`));
           return;
         }
         if (failed) {
-          this.#logger?.warn?.(`qoder: turn reported an error after output was delivered: ${String(message.result).slice(0, 200)}`);
+          this.#logger?.warn?.(`qoder: turn reported an error after output was delivered: ${detail.slice(0, 200)}`);
         }
         // Anything still held is genuine content that never diverged from a marker
         // or a notice, so it is released before the turn closes.
@@ -494,15 +517,17 @@ export class QoderConversation {
     const signal = options.signal;
     const onAbort = () => {
       void session.interrupt();
-      queue.fail(new Error('qoder: request aborted by caller'));
+      queue.fail(cancellation('qoder: the request was cancelled'));
     };
-    if (signal !== undefined) {
-      if (signal.aborted) queue.fail(new Error('qoder: request aborted before it started'));
-      else signal.addEventListener('abort', onAbort, { once: true });
-    }
+    if (signal !== undefined && !signal.aborted) signal.addEventListener('abort', onAbort, { once: true });
 
     let completed = false;
     try {
+      // A turn whose caller is already gone must not be sent at all. Failing the
+      // queue alone was not enough: the prompt below still went out first, so a
+      // cancelled turn spent the account's credit and left the child's history one
+      // exchange longer than this class believed it to be.
+      if (signal?.aborted === true) throw cancellation('qoder: the request was cancelled before it started');
       await session.send(prompt);
       while (true) {
         const result = await queue.next();
@@ -531,6 +556,52 @@ export class QoderConversation {
     this.#closed = true;
     await this.#session.close();
   }
+}
+
+/**
+ * The human-readable reason inside a failed `result` frame.
+ *
+ * Three shapes exist in the wild and only one of them is `result`:
+ *
+ *   `result: "..."`                       a plain message
+ *   `errors: ["...", "..."]`              what a rejected model produces
+ *   neither                               a bare `is_error: true`
+ *
+ * The middle one is why this exists. Preferring `result` alone reduced a real
+ * failure to the empty string, and the driver's own guard — "an error with no
+ * message is not an error" — turned it into a successful, empty turn.
+ *
+ * @param {object} message
+ * @returns {string}
+ */
+function failureDetail(message) {
+  if (typeof message.result === 'string' && message.result.trim().length > 0) return message.result.slice(0, 400);
+  if (Array.isArray(message.errors) && message.errors.length > 0) {
+    const joined = message.errors
+      .filter((entry) => typeof entry === 'string' && entry.trim().length > 0)
+      .join('; ');
+    if (joined.length > 0) return joined.slice(0, 400);
+  }
+  if (typeof message.stop_reason === 'string' && message.stop_reason.length > 0) {
+    return `the turn failed (${message.subtype ?? 'error'}, stop_reason ${message.stop_reason})`;
+  }
+  return `the turn failed (${typeof message.subtype === 'string' ? message.subtype : 'error'})`;
+}
+
+/**
+ * The error a cancelled turn reports.
+ *
+ * Named `AbortError` on purpose: that is what the harness and every HTTP client
+ * already agree means "the caller stopped this", and it is what keeps a cancelled
+ * turn from being reported as, or retried like, an upstream failure.
+ *
+ * @param {string} message
+ * @returns {Error}
+ */
+function cancellation(message) {
+  const error = new Error(message);
+  error.name = 'AbortError';
+  return error;
 }
 
 /** Read the text out of an assistant message's content blocks. */

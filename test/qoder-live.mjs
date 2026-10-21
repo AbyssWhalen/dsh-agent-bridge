@@ -107,5 +107,50 @@ projected.push({ role: 'user', text: second });
 line('\nreplay', JSON.stringify(flattenConversation(projected).slice(0, 120)));
 await turn(projected, 'turn 2');
 
+// ---------------------------------------------------------------------------
+// A turn that must fail, and must be reported as failing.
+//
+// Only the happy path was tested here before, which is exactly why two defects
+// survived a green suite: a failure whose `result` frame carried `errors[]` instead
+// of `result` was read as a clean finish, and a mid-turn failure woke the reader
+// with `{done: true}` instead of an error. Both produced an empty or truncated
+// answer with no exception, and no happy-path test can see that.
+//
+// A model the account does not have is the cheapest guaranteed failure. What is
+// asserted is the *shape* of the failure, not its text: either an exception, or a
+// `finish` whose reason is `error`. What must never happen is a normal stop with no
+// text — that is indistinguishable from a model refusing to answer.
+// ---------------------------------------------------------------------------
+console.log('\n--- a turn that must fail ---');
+const failSession = await driver.openSession({ key: 'live-fail', logger: { debug: () => {}, warn: () => {} } });
+const failChunks = [];
+let failError;
+let failFinish;
+try {
+  for await (const chunk of failSession.send([{ role: 'user', text: 'Reply with exactly: PONG' }], {
+    model: '__not_a_model__',
+    effort
+  })) {
+    failChunks.push(chunk.type);
+    if (chunk.type === 'finish') failFinish = chunk.reason;
+  }
+} catch (error) {
+  failError = error;
+} finally {
+  await failSession.close();
+}
+
+const failedLoudly = failError !== undefined || failFinish?.kind === 'error';
+line('  chunks', JSON.stringify([...new Set(failChunks)]));
+line('  finish', JSON.stringify(failFinish ?? null));
+if (failError !== undefined) line('  error', JSON.stringify(String(failError.message).slice(0, 200)));
+if (!failedLoudly) {
+  outcome.fail(
+    `a turn for an unknown model ended as ${JSON.stringify(failFinish?.kind)} with ` +
+      `${failChunks.filter((type) => type === 'text-delta').length} text delta(s) — a failure was reported as success`
+  );
+}
+line('  verdict', 'failed loudly, as it should');
+
 await driver.close();
 outcome.pass();
