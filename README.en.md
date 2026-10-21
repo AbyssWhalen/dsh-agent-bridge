@@ -137,6 +137,7 @@ npm run test:host       # real apply() against a stand-in ctx: registration, gro
 npm run test:soak       # repeated switch cycles and timer ticks, looking for leaked adapters or routes (-Rounds=N)
 npm run test:collision  # another plugin holding the same provider id: degradation and recovery
 npm run test:live       # live: per-vendor model count, balance, two real turns
+npm run test:counterfactual  # reverse check: put the history truncation back and watch replay-shape go red
 ```
 
 `npm test` matches CI. `test:host`, `test:soak`, `test:collision` and `test:live` need the relevant clients installed; `test:host` prints `SKIPPED` when none are present.
@@ -208,6 +209,24 @@ DSH is a coding agent, so a model that cannot call tools is not usable. The plug
 Replayed history keeps the native structure: an assistant message carries `tool_calls`, and a result answers it by `tool_call_id`. Flattening that into `[tool call: …]` text makes the upstream reject a `tool` message that answers nothing, and leaves two calls indistinguishable to the model.
 
 With real tools present the "you have no tools" preamble is withheld: it contradicts the tool list, and a model handed both answers with `<tool_call>` written as prose — which arrives as **an empty reply on every turn**.
+
+### Recovering calls that arrive as text
+
+Upstream models occasionally lose their structured call channel and write the call **into the content stream**. The plugin intercepts and reconstructs them instead of streaming markup to the screen. Three dialects have been captured from live accounts:
+
+```
+<｜｜DSML｜｜invoke name="pwsh">     ← native DSML; bar counts and the `DSML` letters both drift
+<｜tool_name>pwsh</｜tool_name>      ← invented by the model; followed by <command>…</command>
+<｜tool_call><name>…</name><arguments>{…}</arguments></tool_call>
+```
+
+Detection is deliberately permissive and removal deliberately strict:
+
+- up to 32 bars, the `DSML` letters optional, and the word `parameter` optional on an **opening** tag — every one of those shapes was observed, not imagined;
+- a bare run of bars only counts as a delimiter when a known tag name follows it, so `a || b`, markdown tables and `<b>bold</b>` pass through untouched;
+- a call whose arguments could not be recovered is **not executed**. Showing the raw block beats calling a tool with `{}` — on a live account that mistake made the model retry six times and then declare the harness broken.
+
+A turn where the model repeats `｜` until the budget runs out (500 bars was observed) counts as a degenerate turn: it fails with the reason named rather than rendering the bars as an answer.
 
 ## Known limitations
 

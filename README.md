@@ -142,6 +142,7 @@ npm run test:host       # 替身 ctx 跑真 apply()：注册、分组标题、�
 npm run test:soak       # 反复开关 + 定时刷新，查适配器/路由泄漏（-Rounds=N 改轮数）
 npm run test:collision  # 另一个插件占着同一 provider id 时的降级与恢复
 npm run test:live       # 实机：两家各跑模型数 / 额度 / 两轮真对话
+npm run test:counterfactual  # 反向验证：把历史截断放回去，看 replay-shape 是否变红
 ```
 
 - `npm test` 与 CI 是同一组；`test:host`、`test:soak`、`test:collision`、`test:live` 需要本机装着对应客户端，一个都没有时 `test:host` 打印 `SKIPPED`。
@@ -212,6 +213,24 @@ DSH 是编码代理，模型必须能调用工具才算真的能用。插件把 
 历史里的工具调用也按原生结构重放：助手消息带 `tool_calls`，结果按 `tool_call_id` 对应。**不要**把它压成 `[tool call: …]` 文本——上游会拒绝一条没有对应调用的 `tool` 消息，而模型也分不清两次调用。
 
 有工具时不再注入「你没有工具」的前导语：那和真实工具列表直接矛盾，模型会退回去用 `<tool_call>` 文本代替真正的调用，表现就是**每轮都是空回复**。
+
+### 模型把调用写成文本时的恢复
+
+上游模型的调用通道偶尔不生效，它们会把调用**当正文写出来**。插件拦截并还原成真调用，而不是把标记流到屏幕上。截下来的一共三类方言：
+
+```
+<｜｜DSML｜｜invoke name="pwsh">     ← 原生 DSML，竖线数量与 `DSML` 有无都会漂移
+<｜tool_name>pwsh</｜tool_name>      ← 模型自创的语法，后跟 <command>…</command>
+<｜tool_call><name>…</name><arguments>{…}</arguments></tool_call>
+```
+
+判定规则刻意宽松、删除规则刻意严格：
+
+- 竖线上限 32 根、`DSML` 可省、开标签的 `parameter` 一词可省——这些都在真机上出现过；
+- **裸竖线**只在后面跟已知标签名时才算调用，所以 `a || b`、markdown 表格、`<b>bold</b>` 原样通过；
+- 恢复不出参数就**不执行**。宁可显示原始块让用户看见发生了什么，也不能拿 `{}` 去调工具——真机上这个错误让模型试了六次并最终判定「harness 坏了」。
+
+模型重复 `｜` 到预算耗尽（抓到过 500 根）算退化轮，按失败结束并说明原因，不当作回答渲染。
 
 ## 已知限制
 

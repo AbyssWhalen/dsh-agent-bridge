@@ -369,3 +369,92 @@ Get-ChildItem : Cannot find path 'C:\missing-folder' because it does not exist.
 
 - `flattenConversation()` 本身留着。它「把最后的 user 轮重复一遍」的行为对无状态驱动是对的，`workbuddy` 只在兜底路径用它。改它风险大于收益。
 - 首次请求仍是裸文本（20 字节），不是带壳的 transcript —— 全新子进程没有任何前文可讲，加壳反而告诉它「前面有内容」。
+
+## 十二、第四轮：真机复测又挖出四条
+
+前九条都是靠「读代码 + 驱动直连」找出来的。这一轮换了做法：**先把真 DSH 循环跑起来，把每一轮的完整 transcript 都存下来**，再从失败的轮次里反推。理由很直接——第八条缺陷只存在于真循环里，说明驱动直连的覆盖面本来就不够，继续在离线层面找，找的是离线层面才有的问题。
+
+新增 `_probe/real-loop-capture.ps1`：跑 N 轮，每轮种一个带随机 token 的文件名，把 transcript **无论成败**都写进文件，并在文件头记下种的文件名与判定结果。`tools/real-loop-check.ps1` 只数失败次数，不留下证据；而这里恰恰不能重跑——每轮烧真额度，且缺陷是间歇的。
+
+判定仍然是那两条（token 回来 && 没有标记），但多了一列：**失败轮里模型自己的推理**。这一列贡献了后面一半的发现。
+
+### 第四轮基线
+
+修复前，20 轮里 12 轮干净。失败轮分三类：
+
+| 形状 | 轮数 | 表现 |
+| --- | --- | --- |
+| 竖线墙 | 3 | 满屏 `｜`，工具没跑 |
+| 参数丢失 | 6 | 模型说「参数明明给了却报 missing required property」 |
+| 短散文 | 3 | 只有参数值当正文，没有工具结果 |
+
+### 第十条：子进程死了，下一轮永远不结束
+
+进程在**两轮之间**退出时，`QoderSession` 只调 `onError`，不清 `ready`；`send()` 在 stdin 已销毁时静默 return。于是下一轮跳过 `initialize`、把 prompt 写进一个死管道、然后等一个永远不会来的回复。
+
+探针 `_probe/qoder-child-crash.mjs` 量到的结果：崩溃后的每一轮都是 8 秒超时、零 chunk、零提示（探针设了硬上限，否则就是真的挂死）。
+
+这类失败最坏的地方是它没有形状：不是报错、不是空回答，是**什么都不发生**。用户看到的只是转圈。
+
+修法是把「子进程已死」变成一等状态：
+
+- `QoderSession` 加 `#died` 与 `alive` getter，`exit` / `error` 两条路径都置位并清 `ready`；
+- `#send()` 从「静默 return」改成**抛错**——静默 return 把「子进程没了」伪装成「已经发出去了」；
+- `QoderConversation#ensureChild()` 在 `send()` 与 `listModels()` 开头检查 `alive`，死了就换一个新的，并清掉 `#systemPrompt` 与 `#sent`（新进程什么都没被告知，留着任何一个都会让下一轮把一条孤立的消息追加给陌生人）。
+
+修后：崩溃后的轮次 87ms 正常完成，且**换了新子进程并重放了历史**（探针记录 `children spawned: 2`，且新子进程收到的 prompt 是 replay）。
+
+### 第十一条：子进程在答控制请求时死掉 → 整个 DSH 进程退出
+
+`#dispatch()` 用 `void this.#answerControl(message)` 调用，没人持有那个 promise。而 `fetch_job_token` 这条路径要等凭据、等一次网络往返，之后才写回复——这个窗口里子进程完全可能已经没了。它的 `catch` 又用同一个 `#send()` 写错误回复，于是**第二次抛错没有 awaiter**。
+
+Node 对 unhandled rejection 的默认行为是终止进程。也就是说：子进程在错误时机死一次，整个 DSH 跟着退出。
+
+探针 `_probe/qoder-control-race.mjs` 装一个 `unhandledRejection` 监听（默认是会退出的），量到 `unhandled rejections: 1`，消息正是 `qoder: worker runtime is gone; the request was not sent`。
+
+修法：`#answerControl()` 承诺不再抛——子进程没了就直接记 debug 日志返回（那条回复本来也没有读者），活着的子进程才写错误回复；调用点再加一层 `.catch()` 兜底，让方法内部的 bug 也变不成进程级事件。
+
+### 第十二条：恢复出来的调用是空参数
+
+这条最贵。模型说「参数我明明给了，工具却报 missing required property」，试了 `pwsh` 四次、`glob` 两次，最后判定「这是 harness 的系统性问题」并放弃。
+
+根因不在参数，在**开标签的形状**。真机抓到四种：
+
+```
+<｜ name="command">Get-Location</｜｜DSML｜｜parameter>          ← parameter 这个词没了，只剩一根竖线
+<｜｜DSML｜｜ parameter="command" string="true">…</…parameter>   ← 参数名成了 parameter 属性，不是 name 属性
+<｜｜｜｜｜invoke name="pwsh">…</｜｜DSML｜invoke>               ← 开标签竖线 5~23 根，闭标签 2 根
+（无闭合 </invoke>，参数写完直接进入重复循环）
+```
+
+原来的 `PARAMETER` 正则要求开闭两端都写全 `parameter`、且键必须叫 `name`。四种形状全部落空，而 `INVOKE` 匹配上了——于是调用被恢复成 `{}`，工具拒绝它，屏幕上一点标记都没有。
+
+`_probe/empty-args.mjs` 把这件事变成可数的：扫帧转储，任何「恢复出 `{}` 但源块里明显有参数」的调用都列出来。一次抓取里 **22 个调用中有 10 个是空参数**。
+
+修法：
+
+- 键可以从 `name` / `parameter` / `key` 任一属性读；
+- **开**标签的 `parameter` 一词可省，**闭**标签仍然必需——这个不对称是刻意的，闭标签上的 `parameter` 才是「这不是普通 `<x name="y">`」的证据；
+- 闭合 `invoke` 可缺：参数完整就该用，只有开标签没有参数则不算（那是被截断的一轮，补 `{}` 等于替模型决定去调工具）；
+- 竖线上限从 8 提到 32。上限本身就是个错误的假设——真机出现过 23 根；真正防误判的是竖线后面的标签名，不是长度。
+
+修后同一份帧转储：`calls recovered: 42, empty arguments: 0`。
+
+### 第十三条：退化轮把竖线墙当内容渲染
+
+有的轮次模型直接重复 `｜` 到预算耗尽——真机抓到一次 500 根。原来这些竖线会原样流到屏幕上，看起来像回答。
+
+现在按「这一轮没有产出」处理：`isDegenerate()` 认这种连续竖线（**但要求后面不跟标签名**，否则一个 23 根竖线的合法分隔符会被误杀），驱动层 hold 住并按失败结束，报 `the model degenerated into a repetition loop`。
+
+顺带修了一个意图与实现不符的地方：恢复失败时，注释写的是「宁可显示标记也别吞掉一轮」，而代码 emit 的是 `recovered.rest`——也就是**标记已被剥掉**的残骸，参数值孤零零留在正文里，读起来像模型在胡言乱语，反而把唯一的线索擦了。现在失败时显示原始块。
+
+### 护栏
+
+两个新套件进 `npm test`：
+
+- `test/dsml-dialects.mjs`（21 条）：每一段都是**从真机抓下来的原文抄进去的**，不是照着正则编的。含三种方言与全部退化形状，以及五条「不是调用」的反例（markdown 表格、`<b>`、纯散文、只有 wrapper、`a || b`）。修一个形状补一条，是「先写测试看它红」的顺序做的。
+- `test/dsml-delta-split.mjs`（8 条）：同一批块**按真机抓到的 18 段 delta 边界**送进真驱动，再按**逐字符**送一遍。理由是批处理解析正确不等于流式正确——第十二条的竖线墙就是 `endsWithMarkerPrefix()` 在某个 delta 边界上把 `<` 放了出去。这条测试跑的是驱动，不是复制一份状态机。
+
+### 效果
+
+同一套 20 轮：修复前 12/20 干净，修复后 19/20。剩下那一轮是竖线上限问题，修完后再测 16 轮全绿。
