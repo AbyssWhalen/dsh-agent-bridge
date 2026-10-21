@@ -198,6 +198,8 @@ class AsyncQueue {
  */
 export class QoderConversation {
   #session;
+  /** Everything needed to spawn a replacement child; see {@link #ensureChild}. */
+  #spawnOptions;
   #logger;
   #closed = false;
   /** Fingerprints of the projected messages the child's history now reflects. */
@@ -217,18 +219,46 @@ export class QoderConversation {
    */
   constructor(options) {
     this.#logger = options.logger;
-    this.#session = new QoderSession({
+    this.#spawnOptions = {
       runtimePath: options.runtimePath,
       sdkVersion: options.sdkVersion,
       cwd: options.cwd ?? process.cwd(),
       resolveCredential: options.resolveCredential,
       catalogTtlMs: options.catalogTtlMs,
       logger: options.logger
-    });
+    };
+    this.#session = new QoderSession(this.#spawnOptions);
+  }
+
+  /**
+   * Make sure there is a live child, replacing it when the last one died.
+   *
+   * A `QoderSession` is the lifetime of **one** child process, not a reconnecting
+   * client: once the process is gone there is nothing left to talk to. Before this
+   * existed, a child that exited between turns left `ready` true, so the next turn
+   * skipped `initialize`, wrote its prompt into a destroyed stdin — where `#send()`
+   * dropped it without a word — and then waited for a reply that could never come.
+   * Measured: every turn after the crash hung indefinitely, delivering nothing and
+   * reporting nothing (`_probe/qoder-child-crash.mjs`).
+   *
+   * Both pieces of remembered state go with the child. `#systemPrompt` because a new
+   * process has been told nothing, and `#sent` because its history is empty — keeping
+   * either would make the next turn append a lone message to a stranger.
+   *
+   * @returns {boolean} whether a replacement was spawned.
+   */
+  #ensureChild() {
+    if (this.#session.alive) return false;
+    this.#logger?.warn?.('qoder: worker runtime is gone; starting a replacement');
+    this.#session = new QoderSession(this.#spawnOptions);
+    this.#systemPrompt = '';
+    this.#sent.length = 0;
+    return true;
   }
 
   /** The runtime's own model listing, read over this conversation's transport. */
   async listModels() {
+    this.#ensureChild();
     if (!this.#session.ready) await this.#session.initialize('');
     return this.#session.listModels();
   }
@@ -248,6 +278,10 @@ export class QoderConversation {
    */
   async *send(messages, options = {}) {
     if (this.#closed) throw new Error('qoder: conversation is closed');
+    // A dead child cannot be revived, so it is replaced before anything reads the
+    // state it left behind. This also makes `ready` false below, which is what
+    // re-establishes the framing and empties `#sent`.
+    this.#ensureChild();
     const { system, rest } = splitSystem(messages);
     const tools = Array.isArray(options.tools)
       ? options.tools.filter((tool) => typeof tool?.name === 'string' && tool.name.length > 0)

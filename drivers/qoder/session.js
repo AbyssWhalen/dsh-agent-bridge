@@ -152,6 +152,8 @@ export class QoderSession {
   #payloadDir;
   #jobToken;
   #closed = false;
+  /** Set once the child process is gone, however it went. See {@link alive}. */
+  #died = false;
   #exited;
   #idleTimer;
   #startedAt;
@@ -233,11 +235,19 @@ export class QoderSession {
 
     this.#exited = new Promise((resolve) => {
       child.once('error', (error) => {
+        this.#died = true;
+        this.ready = false;
         this.#fail(new Error(`qoder: worker runtime failed to start: ${String(error)}`));
         resolve({ code: -1, error });
       });
       child.once('exit', (code, signal) => {
         const unexpected = !this.#closed;
+        // The process is gone either way, so the session is spent. `ready` has to say
+        // so: it is what the caller checks before deciding whether a child still needs
+        // to be told what it is, and a stale `true` made every later turn write into a
+        // destroyed pipe and then wait for an answer that could not arrive.
+        this.#died = true;
+        this.ready = false;
         this.#cleanupPayload();
         for (const pending of this.#pending.values()) pending.reject(new Error('qoder: worker runtime exited before replying'));
         this.#pending.clear();
@@ -245,6 +255,19 @@ export class QoderSession {
         resolve({ code, signal });
       });
     });
+  }
+
+  /**
+   * Whether this session still has a child process behind it.
+   *
+   * A session is the lifetime of one child, not a reconnecting client. Callers use this
+   * to decide whether to replace it; see `QoderConversation#ensureChild` for the failure
+   * that made it necessary.
+   *
+   * @returns {boolean}
+   */
+  get alive() {
+    return !this.#closed && !this.#died;
   }
 
   /** Remove the one-shot auth payload directory. */
@@ -296,7 +319,11 @@ export class QoderSession {
     this.#dump(message);
 
     if (message?.type === 'control_request') {
-      void this.#answerControl(message);
+      // `#answerControl` swallows its own failures; the catch is here anyway so that a
+      // bug inside it cannot become a process-killing unhandled rejection.
+      void this.#answerControl(message).catch((error) => {
+        this.#options.logger?.debug?.(`qoder: control reply failed: ${String(error)}`);
+      });
       return;
     }
 
@@ -361,6 +388,17 @@ export class QoderSession {
    * the expiry in milliseconds, which is the shape the runtime validates.
    * Every other subtype gets an empty success — the runtime tolerates that for
    * the optional host hooks, and a missing reply would stall the turn.
+   *
+   * This method must never throw. The caller fires it with `void`, so a rejection
+   * here has no awaiter, and Node terminates the process on an unhandled rejection —
+   * one child dying at the wrong moment would take DSH down. The window is real rather
+   * than theoretical: the token path awaits the credential and a network round trip,
+   * and the reply is written afterwards, so a child that exits during the mint makes
+   * both the success write *and* the error write fail. Measured: one rejection per
+   * occurrence (`_probe/qoder-control-race.mjs`).
+   *
+   * A reply to a dead child is not an error to report: the child is the only thing that
+   * would have read it, and its exit has already been surfaced by the `exit` handler.
    */
   async #answerControl(message) {
     const subtype = message?.request?.subtype ?? message?.request?.type;
@@ -376,10 +414,23 @@ export class QoderSession {
       }
       this.#send({ type: 'control_response', response: { subtype: 'success', request_id: requestId, response: {} } });
     } catch (error) {
-      this.#send({
-        type: 'control_response',
-        response: { subtype: 'error', request_id: requestId, error: error instanceof Error ? error.message : String(error) }
-      });
+      // Two distinct cases arrive here and only one of them is worth a log line: the
+      // mint failed (the child is alive and deserves an error answer), or the write
+      // failed (the child is gone and nobody is listening). Retrying the write in the
+      // second case is what used to throw out of here.
+      if (!this.alive) {
+        this.#options.logger?.debug?.(`qoder: dropped a control reply to a child that had already exited (${String(subtype)})`);
+        return;
+      }
+      this.#options.logger?.debug?.(`qoder: answering control request ${String(subtype)} failed: ${error instanceof Error ? error.message : String(error)}`);
+      try {
+        this.#send({
+          type: 'control_response',
+          response: { subtype: 'error', request_id: requestId, error: error instanceof Error ? error.message : String(error) }
+        });
+      } catch {
+        /* the child went away between the check above and this write */
+      }
     }
   }
 
@@ -398,9 +449,18 @@ export class QoderSession {
     return this.#jobToken;
   }
 
-  /** Write one JSON line to the child. */
+  /**
+   * Write one JSON line to the child.
+   *
+   * Throws when there is nothing to write to. The previous version returned quietly,
+   * which turned "the child is gone" into "the prompt was sent" — the callers then
+   * waited for a reply that could never arrive, so the failure showed up as a turn that
+   * never ended rather than as an error.
+   */
   #send(message) {
-    if (this.#closed || this.#child.stdin.destroyed) return;
+    if (!this.alive || this.#child.stdin.destroyed) {
+      throw new Error('qoder: worker runtime is gone; the request was not sent');
+    }
     this.#child.stdin.write(`${JSON.stringify(message)}\n`);
   }
 
@@ -591,3 +651,4 @@ export class QoderSession {
     return this.#exited ?? Promise.resolve();
   }
 }
+
