@@ -160,6 +160,18 @@ export class WorkBuddyConversation {
     let stalled = false;
     let deadline = Date.now() + STREAM_IDLE_TIMEOUT_MS;
 
+    /**
+     * Whether the caller has already been given something in this turn.
+     *
+     * The reason this is tracked at all: an upstream error frame can arrive *after* the
+     * answer has gone out. Failing the turn at that point throws away an answer the user was
+     * already reading, which is the pathology the Qoder driver fixed after seeing it live —
+     * "text streaming while an error banner appears". A turn that has delivered something is
+     * finished by the end of its stream instead, and the fault is only logged. One that
+     * delivered nothing really did fail, and saying so is the only useful outcome.
+     */
+    const delivered = () => sawToolCall || sawText || sawReasoning;
+
     // An idle *timeout*, not an interval: a long answer that keeps producing
     // frames must never be killed by the clock. The old version fired once from
     // stream start regardless of traffic, so a slow but healthy turn died at the
@@ -190,6 +202,9 @@ export class WorkBuddyConversation {
     let pendingText = '';
     let heldText = '';
     let holding = false;
+    /** Whether anything has been handed to the caller yet; see {@link delivered}. */
+    let sawText = false;
+    let sawReasoning = false;
 
     // The reasoning channel gets the same treatment. It is shown while the turn
     // streams, so markup written there is just as visible — and it is replayed as
@@ -199,6 +214,7 @@ export class WorkBuddyConversation {
 
     const flushText = (part) => {
       if (part.length === 0) return;
+      sawText = true;
       queue.push({ type: 'text-delta', index: textIndex, text: part });
     };
 
@@ -210,6 +226,7 @@ export class WorkBuddyConversation {
         if (/\[tool call:[^\]]*\]/u.test(pendingReasoning) || /<\/[\uFF5C|]{2}\s*DSML[\s\S]*?$/u.test(pendingReasoning)) {
           const cleaned = stripLeak(pendingReasoning);
           if (cleaned.length > 0) {
+            sawReasoning = true;
             queue.push({ type: 'reasoning-delta', index: reasoningIndex, text: cleaned });
           }
           pendingReasoning = '';
@@ -221,6 +238,7 @@ export class WorkBuddyConversation {
         : 0;
       const release = keep === 0 ? pendingReasoning.length : Math.max(0, pendingReasoning.length - keep);
       if (release === 0) return;
+      sawReasoning = true;
       queue.push({ type: 'reasoning-delta', index: reasoningIndex, text: pendingReasoning.slice(0, release) });
       pendingReasoning = pendingReasoning.slice(release);
     };
@@ -230,6 +248,7 @@ export class WorkBuddyConversation {
       if (pendingReasoning.length === 0) return;
       const cleaned = hasLeak(pendingReasoning) ? stripLeak(pendingReasoning) : pendingReasoning;
       if (cleaned.length > 0) {
+        sawReasoning = true;
         queue.push({ type: 'reasoning-delta', index: reasoningIndex, text: cleaned });
       }
       pendingReasoning = '';
@@ -416,6 +435,18 @@ export class WorkBuddyConversation {
                   const failure = readError(parsed);
                   if (failure !== undefined) {
                     closeCalls();
+                    // An error frame can arrive after the answer has gone out. Failing here
+                    // would throw away an answer the user was already reading — the same
+                    // pathology the Qoder driver fixed from a live capture ("text streaming
+                    // while an error banner appears"). With nothing delivered, the turn really
+                    // did fail and the reason is the only useful output.
+                    if (delivered()) {
+                      this.#logger?.warn?.(
+                        `workbuddy: the upstream reported an error after output was delivered: ${failure}`
+                      );
+                      queue.close();
+                      return;
+                    }
                     queue.fail(new Error(`workbuddy: the upstream reported an error: ${failure}`));
                     return;
                   }
@@ -452,6 +483,15 @@ export class WorkBuddyConversation {
 
     try {
       yield* queue;
+      // A stream that ended cleanly having produced nothing is not a clean turn. There is no
+      // wire evidence of a fault — no error frame, no timeout — which is exactly why this
+      // has to be decided here: reported as a `finish`, the caller sees a blank answer, has
+      // no reason to retry, and the turn's credit is gone. An empty reply is also
+      // indistinguishable from a refusal, and a refusal the user cannot see is worse than a
+      // failure they can read.
+      if (!delivered()) {
+        throw new Error('workbuddy: the upstream finished the turn without producing any content');
+      }
       if (sawUsage !== undefined) yield { type: 'usage', usage: sawUsage };
       yield { type: 'finish', reason: { kind: sawToolCall ? 'tool-calls' : 'stop' } };
     } finally {

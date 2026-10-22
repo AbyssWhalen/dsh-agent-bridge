@@ -104,6 +104,81 @@ await check('ordinary prose still renders', async () => {
   assert.equal(failed, undefined);
 });
 
+// ── 3. An error after the answer arrived must not erase the answer ───────────────────
+await check('an upstream error after an answer was delivered keeps the answer', async () => {
+  // The Qoder driver learned this from a live capture: text streaming while an error banner
+  // appears means the caller already read the answer and then the turn is declared dead. Its
+  // rule is that a turn which delivered output is finished by its own result frame, and the
+  // error is only logged. This driver failed the turn unconditionally, so the same upstream
+  // behaviour threw away an answer the user had already seen.
+  const frames = [
+    { choices: [{ delta: { content: 'The answer is 42.' }, index: 0 }] },
+    { error: { message: 'upstream hiccup' } }
+  ];
+  const encoder = new TextEncoder();
+  const conversation = new WorkBuddyConversation({
+    client: {
+      region: 'cn',
+      chatStream: async () => ({
+        body: {
+          async *[Symbol.asyncIterator]() {
+            for (const frame of frames) yield encoder.encode(`data: ${JSON.stringify(frame)}\n\n`);
+          }
+        }
+      })
+    },
+    resolveCredential: async () => ({ token: 'x' }),
+    logger: { debug() {}, warn() {} }
+  });
+
+  const chunks = [];
+  let failure;
+  try {
+    for await (const chunk of conversation.send([{ role: 'user', text: 'go' }], { model: 'fake-model' })) {
+      chunks.push(chunk);
+      if (chunk.type === 'error') failure = chunk.error?.message;
+    }
+  } catch (error) {
+    failure = error.message;
+  }
+
+  const text = chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join('');
+  assert.equal(text, 'The answer is 42.', `the delivered answer was lost: ${JSON.stringify(text)}`);
+  assert.equal(failure, undefined, `an error was raised over an answer that had already arrived: ${failure}`);
+  assert.ok(chunks.some((c) => c.type === 'finish'), 'the turn never finished');
+});
+
+await check('an upstream error before any output is still a failure', async () => {
+  // The other half of the rule: with nothing delivered, the turn really did fail and saying so
+  // is the only useful outcome.
+  const encoder = new TextEncoder();
+  const conversation = new WorkBuddyConversation({
+    client: {
+      region: 'cn',
+      chatStream: async () => ({
+        body: {
+          async *[Symbol.asyncIterator]() {
+            yield encoder.encode(`data: ${JSON.stringify({ error: { message: 'quota exhausted' } })}\n\n`);
+          }
+        }
+      })
+    },
+    resolveCredential: async () => ({ token: 'x' }),
+    logger: { debug() {}, warn() {} }
+  });
+
+  let failure;
+  try {
+    for await (const chunk of conversation.send([{ role: 'user', text: 'go' }], { model: 'fake-model' })) {
+      if (chunk.type === 'error') failure = chunk.error?.message;
+    }
+  } catch (error) {
+    failure = error.message;
+  }
+  assert.notEqual(failure, undefined, 'a turn that produced nothing reported success');
+  assert.match(failure, /quota exhausted/u, `the reason was lost: ${failure}`);
+});
+
 await check('a real call leak is still recovered, not rendered', async () => {
   const block = [
     '<｜｜DSML｜｜calls>',
@@ -117,6 +192,63 @@ await check('a real call leak is still recovered, not rendered', async () => {
   assert.equal(calls.length, 1, `expected 1 call, got ${calls.length}`);
   assert.equal(calls[0].name, 'pwsh');
   assert.deepEqual(JSON.parse(calls[0].arguments), { command: 'Get-Location' });
+});
+
+// ── 4. Cancellation reaches the turn the way the real transport reports it ──────────
+await check('cancelling mid-stream reports a cancellation, keeping what was delivered', async () => {
+  // `chatStream` hands the caller's signal to `fetch`, so a real cancellation reaches the
+  // body iterator as a thrown `AbortError` rather than as silence. The driver's rule is that
+  // one cancellation always looks like one thing: `UpstreamFailure('cancelled')`, not the raw
+  // DOMException, so the host does not report a user's own stop as an upstream fault.
+  const controller = new AbortController();
+  const conversation = new WorkBuddyConversation({
+    client: {
+      region: 'cn',
+      chatStream: async () => ({
+        body: {
+          async *[Symbol.asyncIterator]() {
+            yield new TextEncoder().encode(
+              `data: ${JSON.stringify({ choices: [{ delta: { content: 'working' }, index: 0 }] })}\n\n`
+            );
+            // Then the connection dies the way an aborted fetch dies.
+            await new Promise((resolve) => setTimeout(resolve, 30));
+            const abort = new Error('The operation was aborted');
+            abort.name = 'AbortError';
+            throw abort;
+          }
+        }
+      })
+    },
+    resolveCredential: async () => ({ token: 'x' }),
+    logger: { debug() {}, warn() {} }
+  });
+
+  const cancellationTimer = setTimeout(() => controller.abort(), 10);
+  const chunks = [];
+  let failure;
+  let cancellationKind;
+  try {
+    for await (const chunk of conversation.send([{ role: 'user', text: 'go' }], {
+      model: 'fake-model',
+      signal: controller.signal
+    })) {
+      chunks.push(chunk);
+      if (chunk.type === 'error') {
+        failure = chunk.error?.message;
+        cancellationKind = chunk.error?.kind;
+      }
+    }
+  } catch (error) {
+    failure = error.message;
+    cancellationKind = error.kind;
+  } finally {
+    clearTimeout(cancellationTimer);
+  }
+
+  const text = chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join('');
+  assert.equal(text, 'working', `text delivered before the cancel was lost: ${JSON.stringify(text)}`);
+  assert.notEqual(failure, undefined, 'a cancelled turn reported success');
+  assert.equal(cancellationKind, 'cancelled', `a cancellation was reported as ${JSON.stringify(cancellationKind)}: ${failure}`);
 });
 
 console.log(`\nworkbuddy dialect: ${passed} passed, ${failed} failed`);

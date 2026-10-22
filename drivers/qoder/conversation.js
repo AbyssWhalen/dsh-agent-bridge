@@ -626,6 +626,15 @@ export class QoderConversation {
         // Only a turn with real counts gets a usage chunk; see {@link turnUsage}.
         const reported = turnUsage(usage);
         if (Object.keys(reported).length > 0) queue.push({ type: 'usage', usage: reported });
+        // The `failed` branch above covers a frame that says so. This covers the other half:
+        // a frame that claims success while nothing came out of the turn. There is no wire
+        // evidence to act on — no error, no timeout — so the decision has to be made here or
+        // not at all. Finished as `stop`, an empty turn is a blank answer the caller cannot
+        // act on, and the same indistinguishability from a refusal the comment above names.
+        if (!delivered()) {
+          queue.fail(new Error('qoder: the runtime finished the turn without producing any content'));
+          return;
+        }
         queue.push({ type: 'finish', reason: { kind: sawCall ? 'tool-calls' : 'stop' } });
         queue.close();
       }
