@@ -51,6 +51,8 @@ const encoder = new TextEncoder();
  * @param {{signal?: AbortSignal}} [extra]
  */
 async function qoder(deltas, extra = {}) {
+  if (extra.stopReason !== undefined) process.env.FAKE_STOP_REASON = extra.stopReason;
+  else delete process.env.FAKE_STOP_REASON;
   const file = join(scratch, `q-${Math.random().toString(36).slice(2)}.json`);
   writeFileSync(file, JSON.stringify(deltas));
   process.env.FAKE_DELTAS_FILE = file;
@@ -81,7 +83,13 @@ async function qoder(deltas, extra = {}) {
   } finally {
     await conversation.close();
   }
-  return { chunks, failure, kind, text: chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join('') };
+  return {
+    chunks,
+    failure,
+    kind,
+    finish: chunks.find((c) => c.type === 'finish')?.reason,
+    text: chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join('')
+  };
 }
 
 /**
@@ -127,7 +135,14 @@ async function workbuddy(frames, extra = {}) {
     failure = error.message;
     kind = error.kind;
   }
-  return { chunks, failure, kind, requested, text: chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join('') };
+  return {
+    chunks,
+    failure,
+    kind,
+    requested,
+    finish: chunks.find((c) => c.type === 'finish')?.reason,
+    text: chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join('')
+  };
 }
 
 /** A plain text frame for the WorkBuddy transport. */
@@ -245,6 +260,24 @@ const guarantees = [
       const { text: out, failure } = await workbuddy([text('The answer is 42.')]);
       assert.equal(out, 'The answer is 42.');
       assert.equal(failure, undefined, `a real answer was failed: ${failure}`);
+    }
+  },
+  {
+    // Added after F-034, which was the same defect on both sides and was found only by asking
+    // what each upstream says when it stops early. The harness drops incomplete tool-call blocks
+    // on `max-tokens` and only on `max-tokens`, so both drivers have to say that word for the
+    // guard to run at all.
+    name: 'a turn cut off by a token ceiling says so',
+    async qoder() {
+      const { finish } = await qoder(['The first three are 1, 2, 3 and the fo'], { stopReason: 'max_tokens' });
+      assert.equal(finish?.kind, 'max-tokens', `finished as ${JSON.stringify(finish?.kind)}`);
+    },
+    async workbuddy() {
+      const { finish } = await workbuddy([
+        text('The first three are 1, 2, 3 and the fo'),
+        { choices: [{ delta: {}, index: 0, finish_reason: 'length' }] }
+      ]);
+      assert.equal(finish?.kind, 'max-tokens', `finished as ${JSON.stringify(finish?.kind)}`);
     }
   }
 ];

@@ -381,6 +381,15 @@ export class QoderConversation {
     const indices = new Map();
     let nextIndex = 0;
     let usage;
+    /**
+     * The worker's `stop_reason`, when it named one.
+     *
+     * `max_tokens` means the turn was cut off by a ceiling. It outranks "there were tool calls":
+     * the harness drops tool-call blocks on `max-tokens` and only on `max-tokens` (`dsh-llm`,
+     * `AssistantStreamAccumulator`), so reporting anything else let a call the worker stopped
+     * mid-arguments be treated as complete and run.
+     */
+    let stopReason;
     /** Reply text withheld until it is known not to be a service notice. */
     let noticeProbe = '';
     let released = false;
@@ -583,8 +592,15 @@ export class QoderConversation {
           } else if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
             acceptText(delta.text, event.index);
           }
-        } else if (event?.type === 'message_delta' && event.usage !== undefined) {
-          usage = event.usage;
+        } else if (event?.type === 'message_delta') {
+          // Two facts ride this frame. `usage` was read and `delta.stop_reason` — its sibling —
+          // was dropped, which is how a turn cut off by a token ceiling reported itself as a
+          // clean finish. Verified against the captured dumps: every `message_delta` carries a
+          // `stop_reason` (`end_turn` on healthy turns), so the field is always present and a
+          // truncated turn says `max_tokens` in exactly the same place.
+          if (event.usage !== undefined) usage = event.usage;
+          const reason = event.delta?.stop_reason;
+          if (typeof reason === 'string' && reason.length > 0) stopReason = reason;
         }
         return;
       }
@@ -657,7 +673,12 @@ export class QoderConversation {
           queue.fail(emptyTurn('qoder: the runtime finished the turn without producing any content'));
           return;
         }
-        queue.push({ type: 'finish', reason: { kind: sawCall ? 'tool-calls' : 'stop' } });
+        // A cut-off turn is not a finished one, and it outranks "there were tool calls": a call
+        // the worker stopped mid-arguments would otherwise be reported as complete and run.
+        queue.push({
+          type: 'finish',
+          reason: { kind: stopReason === 'max_tokens' ? 'max-tokens' : sawCall ? 'tool-calls' : 'stop' }
+        });
         queue.close();
       }
     };

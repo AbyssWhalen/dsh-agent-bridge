@@ -56,5 +56,11 @@ createInterface({ input: process.stdin }).on('line', (line) => {
     if (delta.length === 0) continue;
     write({ type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: delta } } });
   }
+  // `stop_reason` rides `message_delta`, alongside the usage the driver already reads. A worker
+  // that hit a token ceiling says `max_tokens` here, and that is the only place it says it.
+  write({
+    type: 'stream_event',
+    event: { type: 'message_delta', delta: { stop_reason: process.env.FAKE_STOP_REASON ?? 'end_turn' }, usage: { output_tokens: 0 } }
+  });
   write({ type: 'result', subtype: 'success', is_error: false, result: resultText });
 });

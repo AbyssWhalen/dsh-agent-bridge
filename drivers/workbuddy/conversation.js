@@ -166,6 +166,19 @@ export class WorkBuddyConversation {
     const openCalls = new Map();
     let sawUsage;
     let sawToolCall = false;
+    /**
+     * The upstream's `finish_reason`, when it named one.
+     *
+     * `length` means the turn was cut off by a token ceiling. Verified from a live request
+     * (`max_tokens: 20` → `finish_reason: "length"`), because the field is absent from the
+     * frame dumps: those capture the Qoder worker's stdout and WorkBuddy is an HTTP stream.
+     *
+     * Ignoring it made a cut-off answer look complete, and — worse — made a cut-off tool call
+     * look runnable. The harness drops tool-call blocks on `max-tokens` and only on `max-tokens`
+     * (`dsh-llm`, `AssistantStreamAccumulator`), so reporting `stop` skipped that guard and a
+     * half-written `{"command":"Get-Chil` reached the tool as if the model had finished typing.
+     */
+    let sawFinishReason;
     let stalled = false;
     let deadline = Date.now() + STREAM_IDLE_TIMEOUT_MS;
 
@@ -415,6 +428,8 @@ export class WorkBuddyConversation {
                   deadline = Date.now() + STREAM_IDLE_TIMEOUT_MS;
                   const usage = readUsage(parsed);
                   if (usage !== undefined) sawUsage = usage;
+                  const cut = readFinishReason(parsed);
+                  if (cut !== undefined) sawFinishReason = cut;
                   for (const delta of readDeltas(parsed)) {
                     if (delta.text !== undefined) {
                       acceptText(delta.text);
@@ -521,7 +536,12 @@ export class WorkBuddyConversation {
         throw emptyTurn('workbuddy: the upstream finished the turn without producing any content');
       }
       if (sawUsage !== undefined) yield { type: 'usage', usage: sawUsage };
-      yield { type: 'finish', reason: { kind: sawToolCall ? 'tool-calls' : 'stop' } };
+      // A cut-off turn is not a finished one, and it outranks "there were tool calls": a call
+      // the upstream stopped mid-arguments would otherwise be reported as complete and run.
+      yield {
+        type: 'finish',
+        reason: { kind: sawFinishReason === 'length' ? 'max-tokens' : sawToolCall ? 'tool-calls' : 'stop' }
+      };
     } finally {
       clearInterval(timer);
       await pump.catch(() => undefined);
@@ -743,6 +763,30 @@ function readToolCalls(delta) {
     calls.push({ index, ...(id === undefined ? {} : { id }), ...(name === undefined ? {} : { name }), argumentsDelta });
   }
   return calls;
+}
+
+/**
+ * The upstream's `finish_reason` from one frame, when it names one.
+ *
+ * Only `length` carries a meaning this driver acts on: it is the one reason that says the turn
+ * was cut short rather than ended. Everything else — `stop`, `content_filter`, and whatever a
+ * future version invents — is reported as an ordinary finish, because the session format accepts
+ * exactly three kinds (`stop`, `tool-calls`, `max-tokens`) and passing an unknown one through
+ * would be rejected outright.
+ *
+ * @param {object} chunk
+ * @returns {string | undefined}
+ */
+function readFinishReason(chunk) {
+  const choices = chunk.choices;
+  if (!Array.isArray(choices)) return undefined;
+  for (const choice of choices) {
+    if (choice === null || typeof choice !== 'object') continue;
+    if (typeof choice.finish_reason === 'string' && choice.finish_reason.length > 0) {
+      return choice.finish_reason;
+    }
+  }
+  return undefined;
 }
 
 /**

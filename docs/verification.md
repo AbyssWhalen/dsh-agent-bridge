@@ -636,7 +636,7 @@ if (lowered.startsWith(stem) && lowered.length - stem.length <= SLACK) return tr
 
 - 离线：`npm run check` 退出码 0；`dsml dialects` 36、`dsml delta split` 13、`workbuddy dialect` 4、`qoder notices` 5。
 - 真机：`capturewb4` 14/14 绿（帧转储 45 帧、0 处标记、0 处参数键异常）；`capturewb5` 12/12 绿（新增空轮/闭合守卫之后，确认没有误杀真实轮次）。
-- 续：`workbuddy-dialect` 7 条、`empty-turn` 6 条、`block-pairing` 3 条、`close-mid-turn` 2 条、`preflight-cancel` 3 条、`driver-parity` 12 条、`failure-taxonomy` 14 条、`workbuddy-usage` 8 条进链；空轮在两个驱动上都已改为失败；调用块在超时与断流两个出口上补了闭合；`close()` 现在会结束正在跑的那一轮；调用前已取消的轮次不再发出请求；两个驱动的取消错误统一带上 `kind` 与 `name` 两种标记；驱动失败经适配器翻译成宿主的 `LlmError` 类别，真机 `UNKNOWN` 已变 `QUOTA`；WorkBuddy 的缓存 token 不再被算成新输入。
+- 续：`workbuddy-dialect` 7 条、`empty-turn` 6 条、`block-pairing` 3 条、`close-mid-turn` 2 条、`preflight-cancel` 3 条、`driver-parity` 12 条、`failure-taxonomy` 14 条、`workbuddy-usage` 8 条、`workbuddy-truncation` 6 条、`qoder-truncation` 6 条进链；空轮在两个驱动上都已改为失败；调用块在超时与断流两个出口上补了闭合；`close()` 现在会结束正在跑的那一轮；调用前已取消的轮次不再发出请求；两个驱动的取消错误统一带上 `kind` 与 `name` 两种标记；驱动失败经适配器翻译成宿主的 `LlmError` 类别，真机 `UNKNOWN` 已变 `QUOTA`；WorkBuddy 的缓存 token 不再被算成新输入；两侧的截断都如实报成 `max-tokens`。
 - 未验证：WorkBuddy 是否也会把额度通知当回答（`H-010`，无证据，未改代码）。
 
 ---
@@ -1052,4 +1052,79 @@ const cached = pick(usage.prompt_tokens_details?.cached_tokens)
 
 所以这次的顺序是：先抓一次真实响应拿到原文，再按原文写用例，最后才改代码。抓取脚本用完即删
 （`test/` 下不留一次性探针，避免下次有人把它当正式测试跑）。
+
+
+---
+
+## 二十三、继续：截断的轮次被报告成"正常结束"
+
+### 第二十八条：两侧都不读 `finish_reason` / `stop_reason`
+
+查完用量接口，接着查同一层上的另一件事：上游说这一轮是被截断的，驱动有没有听。
+
+实测（`max_tokens: 20` 打一次真实请求）：
+
+```
+finish_reason values seen: ["length"]
+```
+
+上游明确说了截断。驱动一个字都没读。后果两个，第二个更严重：
+
+1. **被截断的回答看起来是完整的。** 宿主记成 `finish: stop`，用户读到一句在词中间断掉的话，
+   没有任何提示说有内容被截。
+2. **被截断的工具调用会被保留并执行。** 驱动在流结束时把所有开着的调用收尾，于是"参数还在
+   传"的调用变成一个带半截 JSON 的 `block-end`。而宿主恰好有针对性规则：
+
+   ```js
+   const kept = this.finish.kind === "max-tokens"
+     ? all.map((block) => block.type !== "tool-call")
+     : void 0;
+   ```
+   （`dsh-llm`，`AssistantStreamAccumulator`）
+
+   这条规则只在 `max-tokens` 时触发。报成 `stop` 就等于绕过它，半截的
+   `{"command":"Get-Chil` 会像模型已经写完一样送进工具。
+
+`max-tokens` 是宿主自己的名字（会话格式只接受 `stop`、`tool-calls`、`max-tokens` 三种），
+所以修法就是把它说过的话说回去。优先级上截断**压过**"有工具调用"——报 `tool-calls` 等于告诉
+宿主这个调用已经完整可用。
+
+### 两侧的写法完全不同，缺陷是同一个
+
+| 驱动 | 截断信号在哪 |
+| --- | --- |
+| WorkBuddy | `choices[0].finish_reason === "length"` |
+| Qoder | `stream_event.event.delta.stop_reason === "max_tokens"` |
+
+Qoder 侧尤其说明问题：那个 `message_delta` 帧它**本来就在读**，因为 `usage` 挂在上面——
+
+```js
+} else if (event?.type === 'message_delta' && event.usage !== undefined) {
+  usage = event.usage;
+}
+```
+
+它读了同一帧里的一个字段，丢了旁边那个。这不是"没想到"，是"看到了却没看全"。
+
+Qoder 的字段确实一直都在：翻真机帧转储，每一条 `message_delta` 都带 `stop_reason`
+（健康轮是 `end_turn`），所以截断时它会在完全相同的位置说 `max_tokens`。
+
+### 验证
+
+`test/workbuddy-truncation.mjs`（6 条）、`test/qoder-truncation.mjs`（6 条）、
+`driver-parity` 增加第 7 条保证（截断要说出来，两驱动各自证明）。
+
+反向验证两处：WorkBuddy 的 finish 表达式换回 `sawToolCall ? 'tool-calls' : 'stop'` → 2 条红；
+Qoder 同样处理 → 2 条红。真机 WorkBuddy 8/8 绿。
+
+### 这一轮的方法小结
+
+第二十七、二十八两条都不是靠读代码发现的，都是靠**问"上游到底说了什么"**：
+
+- 缓存 token：抓一次真实响应，拿到完整 usage 对象
+- 截断：故意设一个极小的 `max_tokens`，看上游怎么回答
+
+两次的抓取脚本用完即删。这个动作值得固定成习惯：**凡是驱动要从上游字段里取值的地方，
+都应该先打印一次真实字段，再写代码。** 帧转储帮不了忙——它只捕获 Qoder 子进程的 stdout，
+WorkBuddy 的 HTTP SSE 根本不在里面，而这次的截图正好证明了这一点。
 
