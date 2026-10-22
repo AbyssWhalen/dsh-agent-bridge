@@ -122,6 +122,14 @@ export class WorkBuddyConversation {
    */
   async *send(messages, options = {}) {
     if (this.#closed) throw new Error('workbuddy: conversation is closed');
+    // A turn whose caller is already gone must not be sent at all. Checking only inside the
+    // stream means the request went out, the account was charged, and the model answered
+    // something nobody will read — which is the lesson the Qoder driver learned from a live
+    // capture, where a cancelled turn also left the child's history one exchange longer than
+    // the class believed. This driver has no history to corrupt, but it has the same cost.
+    if (options.signal?.aborted === true) {
+      throw new UpstreamFailure('cancelled', 0, 'the caller cancelled the request before it started');
+    }
     const credential = await this.#resolveCredential();
     const list = Array.isArray(messages) ? messages : [];
     const region = this.#client.region;

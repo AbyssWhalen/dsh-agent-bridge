@@ -636,7 +636,7 @@ if (lowered.startsWith(stem) && lowered.length - stem.length <= SLACK) return tr
 
 - 离线：`npm run check` 退出码 0；`dsml dialects` 36、`dsml delta split` 13、`workbuddy dialect` 4、`qoder notices` 5。
 - 真机：`capturewb4` 14/14 绿（帧转储 45 帧、0 处标记、0 处参数键异常）；`capturewb5` 12/12 绿（新增空轮/闭合守卫之后，确认没有误杀真实轮次）。
-- 续：`workbuddy-dialect` 7 条、`empty-turn` 6 条、`block-pairing` 3 条、`close-mid-turn` 2 条进链；空轮在两个驱动上都已改为失败；调用块在超时与断流两个出口上补了闭合；`close()` 现在会结束正在跑的那一轮。
+- 续：`workbuddy-dialect` 7 条、`empty-turn` 6 条、`block-pairing` 3 条、`close-mid-turn` 2 条、`preflight-cancel` 3 条进链；空轮在两个驱动上都已改为失败；调用块在超时与断流两个出口上补了闭合；`close()` 现在会结束正在跑的那一轮；调用前已取消的轮次不再发出请求。
 - 未验证：WorkBuddy 是否也会把额度通知当回答（`H-010`，无证据，未改代码）。
 
 ---
@@ -799,4 +799,43 @@ this.#endTurn = undefined;
 
 反向验证：把 `close()` 里的 `#endTurn` 调用去掉 → 两条全红。
 
+
+
+---
+
+## 十九、第七轮续四：取消前的飞行前检查，只装在一个驱动上
+
+### 第二十四条：调用前就已被取消，请求照样发出去并扣额度
+
+Qoder 侧有一条守卫，来自 F-005 的真机教训：
+
+```js
+if (signal?.aborted === true) throw cancellation('qoder: the request was cancelled before it started');
+```
+
+注释写得很清楚：只在流里判取消不够——prompt 已经发出去了，额度已经扣了，子进程历史还多
+了一次谁也解释不清的交换。WorkBuddy 侧没有这条。它的 `send()` 直接走到 `chatStream`，
+signal 从头到尾没被看过一眼。
+
+实测：`signal.aborted === true` 的情况下，`chatStream` 仍然被调用（`requested: true`），
+这一轮照样扣额度，答案没人会读。
+
+### 为什么这条值得单独记
+
+它和第十九条是同一个模式的镜像：
+
+- 第十九条：**有检查，但只在一个驱动上**（退化轮）
+- 第二十条：**机制存在，但输入表不全**（额度通知）
+- 第二十一条：**两侧都缺**（空轮）
+- 第二十四条：**同一课，另一个驱动没学**（飞行前取消）
+
+四种都出现过，说明「两个驱动各写一份状态机」这个结构本身在持续产出这种缺陷。每次修完
+一个驱动，正确的动作不是「再看看还有没有别的方言」，而是**去另一个驱动找同一课**。
+
+### 验证
+
+`test/preflight-cancel.mjs`（3 条）：取消在前则请求不发、取消报 `cancelled` 而非上游故障、
+正常 signal 不受影响。反向验证：删掉守卫 → 前两条红。
+
+第三条（防误杀）是必须的：守卫写错会变成「所有轮次都不发」，那比原缺陷严重得多。
 
