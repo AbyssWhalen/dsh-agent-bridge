@@ -17,7 +17,15 @@
  *
  * @module dsh-agent-bridge/drivers/workbuddy/conversation
  */
-import { endsWithMarkerPrefix, hasLeak, hasNativeLeak, MARKER_MAX, parseLeakedCalls, stripLeak } from '../../lib/dsml.js';
+import {
+  endsWithMarkerPrefix,
+  hasLeak,
+  hasNativeLeak,
+  isDegenerate,
+  MARKER_MAX,
+  parseLeakedCalls,
+  stripLeak
+} from '../../lib/dsml.js';
 import { assistantProse, flattenConversation, messageText, splitSystem, toolCallsOf } from '../../lib/messages.js';
 import { UpstreamFailure } from './upstream.js';
 
@@ -239,6 +247,18 @@ export class WorkBuddyConversation {
         pendingText = '';
         return;
       }
+      // A repetition loop, not prose. Live captures contain runs of five hundred fullwidth
+      // bars with no call in them at all — the model repeating one token until it runs out
+      // of budget. A run of bars is not a marker, so without this check it takes the release
+      // path below and the whole wall renders: measured 500 bars of text and no error on
+      // this driver while the Qoder one failed the turn with a named reason. That asymmetry
+      // was the bug — the guard existed on one driver and not the other.
+      if (isDegenerate(pendingText)) {
+        holding = true;
+        heldText = pendingText;
+        pendingText = '';
+        return;
+      }
       // Release everything but a possible marker prefix.
       const keep = endsWithMarkerPrefix(pendingText) ? MARKER_MAX : 0;
       const release = keep === 0 ? pendingText.length : Math.max(0, pendingText.length - keep);
@@ -267,6 +287,10 @@ export class WorkBuddyConversation {
           holding = true;
           heldText = pendingText;
           pendingText = '';
+        } else if (isDegenerate(pendingText)) {
+          holding = true;
+          heldText = pendingText;
+          pendingText = '';
         } else {
           flushText(pendingText);
           pendingText = '';
@@ -274,13 +298,29 @@ export class WorkBuddyConversation {
         }
       }
       if (!holding) return;
-      const native = /DSML/u.test(heldText);
+      const raw = heldText;
+      const native = /DSML/u.test(raw);
       const recovered = native
-        ? parseLeakedCalls(heldText)
-        : { calls: [], rest: stripLeak(heldText), leaked: true };
+        ? parseLeakedCalls(raw)
+        : { calls: [], rest: stripLeak(raw), leaked: true };
+      // Read off the raw held text, not off the recovered block. A wall of bars is not call
+      // syntax at all, so the non-native branch above never asks the parser for a verdict —
+      // taking `degenerate` from the parse result would leave it `undefined` and let exactly
+      // the text this check exists to stop through. Measured: 500 bars rendered again.
+      const degenerate = recovered.degenerate === true || isDegenerate(raw);
       heldText = '';
       holding = false;
       if (recovered.calls.length === 0) {
+        // A repetition loop is not a turn that said nothing — it is a turn that produced
+        // nothing usable, and showing the bars would let it look like an answer. Failing is
+        // the only outcome a user can act on: the reason names the cause, and the
+        // conversation is not poisoned with markup the next turn would imitate.
+        if (degenerate) {
+          queue.fail(
+            new Error('workbuddy: the model degenerated into a repetition loop and produced no answer; retry the turn')
+          );
+          return;
+        }
         if (native) {
           // Nothing parseable: keep the words rather than swallow the turn.
           this.#logger?.warn?.(

@@ -576,3 +576,64 @@ Node 对 unhandled rejection 的默认行为是终止进程。也就是说：子
 `<｜tool>` 在 `MARKER` 里补上，但**刻意不进 `TAG_NAMES`**：`tool` 是讨论标记语言时的普通词，本插件自己的文档就在写它，进了词表就会被清理步骤从句子里吃掉。只匹配"前面带分隔符"的容器，既有流式需要的证据，又不碰散文。
 
 反向验证：把 `CONTAINER` 从两个正则里去掉 → `dialects` 那条容器用例红、`delta split` 两条位移用例红。
+
+---
+
+## 十五、第七轮：同一条守卫只修在一个驱动上
+
+第十八条的修法在真机上 14/14 绿，于是照着"还有没有问题"再查一遍。这一轮的两条不在方言里，在**修复的分布**上。
+
+### 第十九条：退化轮只在 Qoder 侧被拦，WorkBuddy 侧五百根竖线照原样上屏
+
+F-015（退化轮）修在 `drivers/qoder/conversation.js` 里：`acceptText` 判 `isDegenerate` 就 hold，`settleText` 报明原因失败。`drivers/workbuddy/conversation.js` 根本没导入这个函数——两个驱动各写一份流式状态机，同一个守卫只能落一份。
+
+不是"少一个检查"，是**用户能看见**：
+
+| 输入 | 修前 | 修后 |
+| --- | --- | --- |
+| 500 根竖线 | 500 根上屏、不报错 | 失败并说明原因 |
+| 正文 + 300 根竖线 | 318 字符上屏（正文 + 竖线） | 只留已发出的正文，轮次失败 |
+| 普通正文 | 正常 | 正常 |
+| 真实调用泄漏 | 恢复成调用 | 恢复成调用 |
+
+判定条件不能从解析结果里取。竖线墙根本不是调用语法，非原生分支不会问解析器要结论，`recovered.degenerate` 因此是 `undefined`——拿它做判据，拦截等于没写，实测第二次仍然 500 根上屏。改成从**原始 held 文本**判：
+
+```js
+const degenerate = recovered.degenerate === true || isDegenerate(raw);
+```
+
+护栏是 `test/workbuddy-dialect.mjs`（4 条），用假 client 走真实的 SSE 翻译路径，断言的是**用户看到什么**，不是走了哪个分支。反向验证：把 `acceptText` 的退化分支和上面的判据同时去掉 → 2 条红。
+
+### 第二十条：额度通知不在已知通知表里，于是被当成模型自己的回答
+
+`capture15` 那 14 轮里 13 轮挂掉，日志写的是 `You've reached your daily usage limit for Chat. …`。当时判断"上游原文如实透出，不是缺陷"——**这个判断错了一半**。
+
+插件本来就有这个机制：`SERVICE_NOTICES` 把 runtime 的固定通知变成错误，而不是当成模型的回答。它没生效，因为表里只有两条（忙、排队失败），而且**整句精确匹配**：
+
+- 日额度这条不在表里；
+- 就算在，runtime 会在后面接 `Report Issue (input /feedback)`，整句比较对不上真实报文。
+
+后果比"显示一句提示"严重：它被记成 assistant 的内容，下一轮作为历史重放，会话就此污染。
+
+改成前缀词干匹配（三条），并且**同时**修 hold 窗口。只改匹配是不够的——`couldBeServiceNotice` 原来只判"仍是某条通知的前缀"，通知一长出词干一个字符，窗口就关了、内容当场放出去，末尾的精确判定已经没有东西可查。实测：只加词干不改窗口，忙那条从"能识别"退化成"被当回答"，红 3 条。所以是两个窗口：
+
+```js
+if (stem.startsWith(lowered)) return true;                                   // 还在长成通知
+if (lowered.startsWith(stem) && lowered.length - stem.length <= SLACK) return true;  // 通知 + 尾巴
+```
+
+`SLACK = 120` 是上界也是保险：以这些句子开头、但后面还有大段真实内容的回答会长过窗口被放出去，然后按回答处理——失败要往上取整，不能把一个正常回答判成上游故障。
+
+护栏是 `test/qoder-notices.mjs`（5 条），含两条反向用例：`The daily usage limit for Chat is 2900 credits.` 与 `You've reached the end of the file. …` 必须仍然是回答。反向验证：删掉第二个窗口 → 3 条红。
+
+### 这一轮真正学到的东西
+
+前六轮的每一条都是"模型写了什么奇怪形状"。这一轮两条都是**"修在了哪"**——同一个逻辑有两份实现，改了一份，另一份就是活的缺陷；一个机制存在但输入表不全，机制等于不在。
+
+对应的做法不是再读一遍代码，是给每个驱动配**同形**的行为套件：`workbuddy-dialect.mjs` 与 `qoder-notices.mjs` 断言的是同一类用户可见结果（标记不上屏、退化成失败、通知成错误），任何一侧单独失效都会各自变红。
+
+## 第七轮状态
+
+- 离线：`npm run check` 退出码 0；`dsml dialects` 36、`dsml delta split` 13、`workbuddy dialect` 4、`qoder notices` 5。
+- 真机：`capturewb4` 14/14 绿（帧转储 45 帧、0 处标记、0 处参数键异常）。
+- 未验证：WorkBuddy 是否也会把额度通知当回答（`H-010`，无证据，未改代码）。

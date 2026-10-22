@@ -40,39 +40,82 @@ import { appendPrompt, flattenTranscript, isStraightAppend, messageFingerprint, 
 /**
  * The runtime announces a saturated queue as an ordinary answer, so the opening
  * characters of a reply cannot be forwarded immediately: a notice has to become an
- * error instead of appearing as the model's own words. Both strings are the
- * runtime's, matched whole and lower-cased.
+ * error instead of appearing as the model's own words.
  */
-const SERVICE_NOTICES = new Set([
-  'the model is busy and could not complete the request. please try again later.',
-  'queuing failed. try again later or enter /model to switch models.'
-]);
+
+/**
+ * What the runtime says instead of an answer, as lower-cased stems.
+ *
+ * Trailing text is why these are stems and not whole sentences. The allowance notice arrives
+ * as
+ *
+ *     You've reached your daily usage limit for Chat. Come back tomorrow to continue working
+ *     with me. Report Issue (input /feedback)
+ *
+ * — the runtime appends a support hint. An exact match on any fixed wording misses the real
+ * wire text, and the miss is silent: the notice becomes the assistant's answer, is shown as
+ * if the model wrote it, and is replayed as history on the next turn. `capture15` was
+ * thirteen turns of that, each reported as a success.
+ *
+ * Matching is anchored at the start, so an ordinary answer that merely mentions the words
+ * (`The daily usage limit for Chat is 2900 credits.`) is still an answer.
+ */
+const SERVICE_NOTICE_STEMS = [
+  'the model is busy and could not complete the request',
+  'queuing failed',
+  "you've reached your daily usage limit"
+];
+
+/**
+ * How much text may follow a notice stem and still be treated as part of the notice.
+ *
+ * The runtime appends a support hint (`Report Issue (input /feedback)`, about 30 characters)
+ * and the allowance notice carries a trailing sentence of its own, so some slack is needed.
+ * The bound matters as much as the slack: an *answer* that happens to open with one of these
+ * sentences is released once it grows past the bound, and is then treated as the answer it
+ * is. Without a bound the hold would last to the end of the turn and every such answer would
+ * be reported as an upstream failure.
+ */
+const SERVICE_NOTICE_TAIL_SLACK = 120;
 
 /**
  * Whether text is still on course to be a service notice.
  *
- * Used as a hold predicate: while it holds, nothing is emitted, because a notice
- * that has not diverged from a known notice yet may still turn into one.
+ * Used as a hold predicate: while it holds, nothing is emitted, because the text may still
+ * turn out to be a notice, and once emitted a notice cannot be taken back.
+ *
+ * Two windows, not one. Text is on course while it is still a prefix of a stem (`the model i`
+ * → `the model is busy…`), **and** while it is a stem followed by a short tail (the finished
+ * notice plus whatever the runtime added after it). Matching only the first window was the
+ * original shape of this function and it cannot work with stems: the moment the notice grew
+ * one character past its stem the hold ended, the notice was released as the model's answer,
+ * and the exact-match check at the end of the turn had nothing left to inspect.
  *
  * @param {string} held
  * @returns {boolean}
  */
 function couldBeServiceNotice(held) {
   const lowered = held.trimStart().toLowerCase();
-  for (const notice of SERVICE_NOTICES) {
-    if (notice.startsWith(lowered)) return true;
+  for (const stem of SERVICE_NOTICE_STEMS) {
+    if (stem.startsWith(lowered)) return true;
+    if (lowered.startsWith(stem) && lowered.length - stem.length <= SERVICE_NOTICE_TAIL_SLACK) return true;
   }
   return false;
 }
 
 /**
- * Whether text is exactly a service notice.
+ * Whether text is a service notice.
+ *
+ * Nothing held is not a notice: the empty string is a prefix of every stem, so without the
+ * length guard an empty reply would be reported as an upstream failure with no message.
  *
  * @param {string} held
  * @returns {boolean}
  */
 function isServiceNotice(held) {
-  return SERVICE_NOTICES.has(held.trim().toLowerCase());
+  const lowered = held.trim().toLowerCase();
+  if (lowered.length === 0) return false;
+  return SERVICE_NOTICE_STEMS.some((stem) => lowered.startsWith(stem));
 }
 
 /**
