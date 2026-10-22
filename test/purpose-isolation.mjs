@@ -200,6 +200,35 @@ await check('the conversation continues on its own child after a title request',
   assert.equal(last.replay, false, 'the conversation was rebuilt instead of continued');
 });
 
+// ── 3b. Compaction is the other purpose, and the same rule has to hold ────────────
+await check('a compaction request does not enter the conversation history', async () => {
+  const logFile = join(scratch, 'compact.jsonl');
+  process.env.FAKE_MEASURE_LOG = logFile;
+  process.env.FAKE_REPLY = 'summary';
+  const adapter = qoderAdapter();
+  try {
+    await run(adapter, firstTurn());
+    // Compaction is handed the whole history and asked to summarise it. Into a child that
+    // already holds that history it would append a duplicate of the entire conversation.
+    await run(adapter, { purpose: 'compaction', ...secondTurn() });
+    await run(adapter, secondTurn());
+  } finally {
+    await adapter.close();
+  }
+  const log = entries(logFile);
+  const order = log.map((entry) => entry.kind);
+  const firstPrompt = order.indexOf('prompt');
+  const secondFraming = order.indexOf('framing', firstPrompt);
+  const compactionPrompt = order.indexOf('prompt', firstPrompt + 1);
+  assert.notEqual(secondFraming, -1, 'compaction reused the conversation child');
+  assert.ok(
+    secondFraming < compactionPrompt,
+    `the compaction prompt went to the conversation's child (framing ${secondFraming}, prompt ${compactionPrompt})`
+  );
+  const last = log.filter((entry) => entry.kind === 'prompt').at(-1);
+  assert.equal(last.replay, false, 'the conversation was rebuilt after compaction');
+});
+
 // ── 4. Nothing else about an ordinary turn may change ─────────────────────────────
 await check('an ordinary turn still reuses the pooled child', async () => {
   const logFile = join(scratch, 'plain.jsonl');
