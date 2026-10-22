@@ -40,7 +40,8 @@
     "test:collision": "node test/integration/collision.mjs",
     "test:live": "node test/qoder-live.mjs && node test/workbuddy-live.mjs && node test/tools-live.mjs",
     "test:counterfactual": "node test/replay-truncation-counterfactual.mjs",
-    "check": "npm test && npm run test:host && npm run test:collision"
+    "check": "npm test && npm run test:host && npm run test:collision",
+    "census": "node tools/tag-census.mjs && node tools/residue-census.mjs"
   },
   "repository": {
     "type": "git",
