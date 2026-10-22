@@ -636,7 +636,7 @@ if (lowered.startsWith(stem) && lowered.length - stem.length <= SLACK) return tr
 
 - 离线：`npm run check` 退出码 0；`dsml dialects` 36、`dsml delta split` 13、`workbuddy dialect` 4、`qoder notices` 5。
 - 真机：`capturewb4` 14/14 绿（帧转储 45 帧、0 处标记、0 处参数键异常）；`capturewb5` 12/12 绿（新增空轮/闭合守卫之后，确认没有误杀真实轮次）。
-- 续：`workbuddy-dialect` 7 条、`empty-turn` 6 条、`block-pairing` 3 条、`close-mid-turn` 2 条、`preflight-cancel` 3 条、`driver-parity` 12 条、`failure-taxonomy` 14 条、`request-options` 10 条、`workbuddy-usage` 8 条、`workbuddy-truncation` 6 条、`qoder-truncation` 6 条进链；空轮在两个驱动上都已改为失败；调用块在超时与断流两个出口上补了闭合；`close()` 现在会结束正在跑的那一轮；调用前已取消的轮次不再发出请求；两个驱动的取消错误统一带上 `kind` 与 `name` 两种标记；驱动失败经适配器翻译成宿主的 `LlmError` 类别，真机 `UNKNOWN` 已变 `QUOTA`；WorkBuddy 的缓存 token 不再被算成新输入；两侧的截断都如实报成 `max-tokens`；标题轮不再带满档推理、上限真的发到线上。
+- 续：`workbuddy-dialect` 7 条、`empty-turn` 6 条、`block-pairing` 3 条、`close-mid-turn` 2 条、`preflight-cancel` 3 条、`driver-parity` 12 条、`failure-taxonomy` 14 条、`request-options` 10 条、`purpose-isolation` 5 条、`workbuddy-usage` 8 条、`workbuddy-truncation` 6 条、`qoder-truncation` 6 条进链；空轮在两个驱动上都已改为失败；调用块在超时与断流两个出口上补了闭合；`close()` 现在会结束正在跑的那一轮；调用前已取消的轮次不再发出请求；两个驱动的取消错误统一带上 `kind` 与 `name` 两种标记；驱动失败经适配器翻译成宿主的 `LlmError` 类别，真机 `UNKNOWN` 已变 `QUOTA`；WorkBuddy 的缓存 token 不再被算成新输入；两侧的截断都如实报成 `max-tokens`；标题轮不再带满档推理、上限真的发到线上；`purpose` 请求不再污染对话历史。
 - 未验证：WorkBuddy 是否也会把额度通知当回答（`H-010`，无证据，未改代码）。
 
 ---
@@ -1193,4 +1193,72 @@ after  (effort=none, max_tokens=64): out=6   reasoningTokens=0  reasoningChars=0
 如果宿主从不传，这次改动就是死代码，而且测试会绿得毫无意义。所以先插桩、先看真机，
 再动手。这已经是本轮第三次用同一招（缓存字段、截断信号、请求字段），值得当成本项目的固定
 动作：**边界上的每一个字段，都要在真机上打印一次再写代码。**
+
+
+---
+
+## 二十五、继续：标题请求被塞进用户的对话里
+
+### 第三十条：池键只看 `sessionId`，`purpose` 请求与主对话共用同一个子进程
+
+上一节修完字段丢失，顺带注意到标题轮带 `purpose`。于是插桩打印池键和 `sessionId`，跑一次真实
+loop：
+
+```
+KEY purpose=undefined        sessionId="session-10ff…" key=session-10ff… msgs=4
+KEY purpose="session-title"  sessionId="session-10ff…" key=session-10ff… msgs=1
+KEY purpose=undefined        sessionId="session-10ff…" key=session-10ff… msgs=6
+```
+
+**标题请求带的是主对话的 `sessionId`。** 对 WorkBuddy 无害——它无状态，每个请求自带
+`messages`。但 Qoder 的池化会话**就是一个活着、带历史的子进程**，标题提示被追加进去：
+
+```
+user: <真实问题>
+assistant: <回答>
+user: 给这段对话起个短标题
+assistant: "Sorting It Out"
+user: <下一个问题>
+```
+
+模型于是认为用户在对话中间让它起标题。而且还有第二层伤害：标题轮之后 `#sent` 指纹与真实对话
+不再匹配，下一轮只能**整篇重放**到一个已经多了两轮的子进程上——第一个问题在历史里出现两次。
+
+这是本项目第七轮已经记过的那类问题："被取消的轮次让子进程的历史比类以为的多一轮"，只是换了
+个入口。
+
+### 修法：`purpose` 请求用一次性会话
+
+池键加 `purpose` 后缀（用会话 id 里不可能出现的分隔符），并且这类请求用完就 `discard`
+而不是 `release`——否则会为一个永远不会继续的对话留着一个子进程。
+
+### 验证
+
+`test/purpose-isolation.mjs`（5 条）：标题不进主对话、标题有自己的子进程、之后对话仍走追加
+而不是重放、普通轮仍复用同一个子进程、无状态驱动不受影响。
+
+反向验证：去掉键后缀 → 2 条红。
+
+### 这一条差点又被写成假绿灯
+
+第一版测试每轮都新建适配器，于是池从来不跨轮生效，三个断言"通过"得毫无意义——"标题请求有
+自己的子进程"之所以成立，是因为**每个**请求都有自己的子进程。
+
+第二版改成同一个适配器跑三轮，但三轮回的 `messages` 完全一样，追加分支靠内容就能匹配，还是
+看不出池有没有做对。
+
+第三版让对话真的增长（第一问 / 标题 / 第一问 + 回答 + 第二问），并把第一个断言从
+`replay === false` 换成**日志顺序**：标题提示必须发给一个在它之后才启动的子进程。用
+`replay` 判断是错的——追加分支本来就不会把自己标成重放，那个断言在缺陷存在时也是绿的。
+
+### 方法记录
+
+这一条是**从上一节的边角料里长出来的**。`purpose` 字段本来只是"适配器漏掉的三个字段之一"，
+修那个漏字段时顺手确认它还带什么，才发现会话污染。
+
+值得记住的是：一个被丢弃的字段，可能不只是"少传一个参数"，而可能是**一条本该被区分开的语义**。
+`purpose` 的语义是"这不是对话的一部分"，适配器把它当普通轮处理，代价是污染历史。
+
+另外，`isStraightAppend` 这类指纹机制的存在，说明这个项目早就知道"子进程历史必须与类认知
+一致"。缺陷不是没人想到，是**新入口没有接进已有的保护**。
 
