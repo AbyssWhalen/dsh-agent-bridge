@@ -189,8 +189,7 @@ recovers('tool_call with a JSON arguments child', TOOL_CALL_JSON, 'pwsh', {
 });
 
 // Live: the same idea written with the bare tag names the model quoted from the prompt.
-const TOOL_NAME_SIBLINGS = [
-  'I will list the files in the current directory.',
+const TOOL_NAME_SIBLINGS = [  'I will list the files in the current directory.',
   '',
   '<｜tool_name>pwsh</｜tool_name>',
   '<command>Get-ChildItem -Force | Format-Table Mode, LastWriteTime, Length, Name</command>',
@@ -207,6 +206,76 @@ check('tool_name keeps the prose that came before it', () => {
   const { calls, rest } = parseLeakedCalls(TOOL_NAME_SIBLINGS);
   assert.equal(calls.length, 1);
   assert.equal(rest, 'I will list the files in the current directory.');
+});
+
+// ── 2b. A wrapper around the parameters ───────────────────────────────────────────────
+//
+// Live, sixth round. The parameters were wrapped in an `<args>` element:
+//
+//   <｜tool_calls>
+//   <tool>
+//   <tool_name>pwsh</tool_name>
+//   <args>
+//   <command>Get-ChildItem -Force | …</command>
+//   <description>List files in current directory</description>
+//   </args>
+//   </tool>
+//   </｜tool_calls>
+//
+// The sibling scan read that as **one** parameter named `args` whose value was the inner
+// tags as text. The call then executed with a single unknown argument, the tool rejected it
+// for `required property 'command' is missing`, and the model retried in four different
+// formats while concluding the harness was broken — the F-012 failure again, one wrapper out.
+const WRAPPED_ARGS = [
+  '<｜tool_calls>',
+  '<tool>',
+  '<tool_name>pwsh</tool_name>',
+  '<args>',
+  '<command>Get-ChildItem -Force | Select-Object Name, Mode, Length | Format-Table -AutoSize</command>',
+  '<description>List files in current directory</description>',
+  '</args>',
+  '</tool>',
+  '</｜tool_calls>'
+].join('\n');
+
+recovers('a wrapper element around the parameters is unwrapped', WRAPPED_ARGS, 'pwsh', {
+  command: 'Get-ChildItem -Force | Select-Object Name, Mode, Length | Format-Table -AutoSize',
+  description: 'List files in current directory'
+});
+
+check('a wrapper holding a JSON object is unwrapped too', () => {
+  const block = [
+    '<｜tool_calls>',
+    '<tool_name>pwsh</tool_name>',
+    '<args>{"command": "Get-Location", "description": "print cwd"}</args>',
+    '</｜tool_calls>'
+  ].join('\n');
+  const { calls } = parseLeakedCalls(block);
+  assert.equal(calls.length, 1, `expected 1 call, got ${calls.length}`);
+  assert.deepEqual(JSON.parse(calls[0].arguments), { command: 'Get-Location', description: 'print cwd' });
+});
+
+check('a genuine parameter named args is left alone', () => {
+  // The unwrap is only safe when the wrapper is the sole property AND its value looks like a
+  // bag. A tool that really takes `args` as a string must keep it.
+  const block = [
+    '<｜tool_calls>',
+    '<tool_name>docker_run</tool_name>',
+    '<args>--rm alpine uname -a</args>',
+    '</｜tool_calls>'
+  ].join('\n');
+  const { calls } = parseLeakedCalls(block);
+  assert.equal(calls.length, 1, `expected 1 call, got ${calls.length}`);
+  assert.deepEqual(JSON.parse(calls[0].arguments), { args: '--rm alpine uname -a' });
+});
+
+check('the canonical dialect unwraps a parameter named args too', () => {
+  const block = '<｜｜DSML｜｜calls>\n<｜｜DSML｜invoke name="pwsh">\n'
+    + '<｜｜DSML｜parameter name="args"><command>Get-Location</command><description>cwd</description></｜｜DSML｜parameter>\n'
+    + '</｜｜DSML｜invoke>\n</｜｜DSML｜calls>';
+  const { calls } = parseLeakedCalls(block);
+  assert.equal(calls.length, 1, `expected 1 call, got ${calls.length}`);
+  assert.deepEqual(JSON.parse(calls[0].arguments), { command: 'Get-Location', description: 'cwd' });
 });
 
 // The `argument` spelling, which the prompt's own example uses.
@@ -279,6 +348,53 @@ check('an unparseable argument fence runs nothing but still hides the markup', (
   ].join('\n');
   const { calls } = parseLeakedCalls(truncated);
   assert.deepEqual(calls, [], 'a call was invented from an incomplete argument bag');
+});
+
+// ── 3b. The displacement dialect: `invoke` slid out of the tag and into the attribute ──
+//
+// Live, sixth round:
+//
+//   <｜｜DSML｜｜calls>
+//   <｜｜｜｜call invoke="name">pwsh</｜｜DSML｜｜calls>
+//   <｜｜｜｜invoke name="command">Get-ChildItem -Force</｜｜DSML｜｜parameter>
+//   <｜｜｜｜invoke name="description">List files</｜｜DSML｜｜parameter>
+//   </｜｜DSML｜calls>
+//
+// Read literally this is not a grammar: a `call` element whose `invoke` attribute is
+// `name`, and an `invoke` element with a `name` attribute. Read as a displacement it is the
+// ordinary form with one token shifted — `invoke name="pwsh"` became
+// `call invoke="name">pwsh`, and `parameter name="command"` became `invoke name="command"`.
+const DISPLACED = [
+  '<｜｜DSML｜｜calls>',
+  '<｜｜｜｜call invoke="name">pwsh</｜｜DSML｜｜calls>',
+  '<｜｜｜｜invoke name="command">Get-ChildItem -Force | Select-Object Name, Mode, Length | Format-Table -AutoSize</｜｜DSML｜｜parameter>',
+  '<｜｜｜｜invoke name="description">List files in current directory</｜｜DSML｜｜parameter>',
+  '</｜｜DSML｜calls>'
+].join('\n');
+
+recovers('the displacement dialect yields the tool and its parameters', DISPLACED, 'pwsh', {
+  command: 'Get-ChildItem -Force | Select-Object Name, Mode, Length | Format-Table -AutoSize',
+  description: 'List files in current directory'
+});
+
+check('a displacement with no parameters is not turned into a call', () => {
+  // The tool name alone never said what to run. Removing the markup is still required;
+  // inventing `{}` here is the F-012 mistake one dialect further out.
+  const bare = '<｜｜DSML｜｜calls>\n<｜｜｜｜call invoke="name">pwsh</｜｜DSML｜｜calls>\n</｜｜DSML｜calls>';
+  assert.deepEqual(parseLeakedCalls(bare).calls, []);
+  assert.equal(/[\uFF5C]/u.test(stripLeak(bare)), false);
+});
+
+check('the ordinary form is untouched by the displacement branch', () => {
+  // Guard check: `invoke name="pwsh"` is the canonical spelling and must keep reading as a
+  // tool name, not be re-read as a parameter named `pwsh`.
+  const canonical = '<｜｜｜｜｜｜invoke name="pwsh">\n'
+    + '<｜｜｜｜parameter name="command">Get-Location</｜｜｜｜｜parameter>\n'
+    + '</｜｜｜｜invoke>';
+  const { calls } = parseLeakedCalls(canonical);
+  assert.equal(calls.length, 1, `expected 1 call, got ${calls.length}`);
+  assert.equal(calls[0].name, 'pwsh');
+  assert.deepEqual(JSON.parse(calls[0].arguments), { command: 'Get-Location' });
 });
 
 // ── 4. Nothing must be invented where there is no call ───────────────────────────────

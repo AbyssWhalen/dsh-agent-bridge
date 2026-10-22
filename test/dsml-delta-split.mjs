@@ -116,6 +116,33 @@ const LIVE_BOUNDARIES = [
 for (const split of [false, true]) {
   const label = split ? 'one character at a time' : 'the captured delta boundaries';
 
+  await check(`the displacement dialect yields a call (${label})`, async () => {
+    // The hold depends on `call` being a known tag name. The bare delimiter only counts as a
+    // marker ahead of one, so before `call` joined that list an *unwrapped* block opening
+    // with `<｜｜｜｜call invoke="name">` was released as text one character at a time:
+    // measured `calls=0`, bars in the text channel. The wrapped form passes either way
+    // because `<｜｜DSML｜｜calls>` arrives first and holds on its own.
+    const wrapped = [
+      '<｜｜DSML｜｜calls>',
+      '<｜｜｜｜call invoke="name">pwsh</｜｜DSML｜｜calls>',
+      '<｜｜｜｜invoke name="command">Get-ChildItem -Force</｜｜DSML｜｜parameter>',
+      '</｜｜DSML｜calls>'
+    ].join('\n');
+    const unwrapped = [
+      'Let me list the files.',
+      '<｜｜｜｜call invoke="name">pwsh</｜｜DSML｜｜calls>',
+      '<｜｜｜｜invoke name="command">Get-ChildItem -Force</｜｜DSML｜｜parameter>'
+    ].join('\n');
+
+    for (const block of [wrapped, unwrapped]) {
+      const { text, calls } = await run([block], split);
+      assert.equal(calls.length, 1, `expected 1 call, got ${calls.length} from ${JSON.stringify(block.slice(0, 40))}`);
+      assert.equal(calls[0].name, 'pwsh');
+      assert.deepEqual(JSON.parse(calls[0].arguments), { command: 'Get-ChildItem -Force' });
+      assert.equal(/[\uFF5C\u2581]/u.test(text), false, `markup reached the text channel: ${JSON.stringify(text)}`);
+    }
+  });
+
   await check(`native control tokens yield a call (${label})`, async () => {
     // The tokenizer's own reserved tokens, streamed, in both shapes the model writes them.
     //

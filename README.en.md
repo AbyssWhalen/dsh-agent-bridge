@@ -212,22 +212,25 @@ With real tools present the "you have no tools" preamble is withheld: it contrad
 
 ### Recovering calls that arrive as text
 
-Upstream models occasionally lose their structured call channel and write the call **into the content stream**. The plugin intercepts and reconstructs them instead of streaming markup to the screen. Four shapes have been captured from live accounts:
+Upstream models occasionally lose their structured call channel and write the call **into the content stream**. The plugin intercepts and reconstructs them instead of streaming markup to the screen. Five shapes have been captured from live accounts:
 
 ```
 <｜｜DSML｜｜invoke name="pwsh">     ← native DSML; bar counts and the `DSML` letters both drift
 <｜tool_name>pwsh</｜tool_name>      ← invented by the model; followed by <command>…</command>
 <｜tool_call><name>…</name><arguments>{…}</arguments></tool_call>
 <｜｜｜▁begin｜>function<｜tool▁sep｜>pwsh  ```json {…} ```  ← the tokenizer's own control tokens
+<｜｜｜｜call invoke="name">pwsh     ← `invoke` slid into the attribute slot; parameters as <invoke name="command">…
 ```
 
-The fourth is not a dialect a model invented: those are its **native function-calling tokens** arriving in the content channel (`▁` is U+2581, the glyph a tokenizer uses for a space). Its arguments are a fenced JSON object, which makes it the easiest of the four to recover.
+The fourth is not a dialect a model invented: those are its **native function-calling tokens** arriving in the content channel (`▁` is U+2581, the glyph a tokenizer uses for a space). Its arguments are a fenced JSON object, which makes it the easiest of the five to recover.
+
+The fifth is a **displacement**: the word `invoke` moved out of the tag name and into an attribute (`call invoke="name">pwsh`), and the parameters came out as `<invoke name="command">value</…parameter>`. Both readings of the displaced token — decoration, or field label — agree on the tool name, which is why this is recoverable rather than a guess.
 
 Detection is deliberately permissive and removal deliberately strict:
 
 - up to 32 bars, the `DSML` letters optional, the word `parameter` optional on an **opening** tag, and `_` interchangeable with U+2581 — every one of those shapes was observed, not imagined;
-- a bare run of bars only counts as a delimiter when a known tag name follows it, so `a || b`, markdown tables and `<b>bold</b>` pass through untouched;
-- a call whose arguments could not be recovered is **not executed**. Showing the raw block beats calling a tool with `{}` — on a live account that mistake made the model retry six times and then declare the harness broken. A truncated JSON fence is treated the same way.
+- a bare run of bars only counts as a delimiter when a known tag name follows it, so `a || b`, markdown tables and `<b>bold</b>` pass through untouched — and conversely, a shape whose tag name is missing from that list has its opening released as text by the stream;
+- a call whose arguments could not be recovered is **not executed**. Showing the raw block beats calling a tool with `{}` — on a live account that mistake made the model retry six times and then declare the harness broken. A truncated JSON fence, and a displacement with no parameters, are treated the same way.
 
 A turn where the model repeats `｜` until the budget runs out (500 bars was observed) counts as a degenerate turn: it fails with the reason named rather than rendering the bars as an answer.
 

@@ -513,3 +513,58 @@ Node 对 unhandled rejection 的默认行为是终止进程。也就是说：子
 - 方言 C 的原文按「整串」与「逐字符」两种方式压过真驱动：调用与参数都对，无标记泄漏。
 - 真机 14 轮 14 绿（`capture11`）。这条形状稀有，这一批没再出现，所以复现靠上面那次原文压测。
 - 离线：`dsml dialects` 27 条、`dsml delta split` 11 条，`npm run check` 退出码 0。
+
+## 十四、第六轮：`invoke` 滑进属性位，参数被包在一层壳里
+
+桌面端重启后的第一批 14 轮里，两轮各给出一种新形状。它们不是同一类问题：一个是**语法位移**，一个是**参数被包了一层**。
+
+### 第十六条：`invoke` 从标签名滑到了属性位上
+
+```
+<｜｜DSML｜｜calls>
+<｜｜｜｜call invoke="name">pwsh</｜｜DSML｜｜calls>
+<｜｜｜｜invoke name="command">Get-ChildItem -Force | Select-Object Name, Mode, Length | Format-Table -AutoSize</｜｜DSML｜｜parameter>
+<｜｜｜｜invoke name="description">List files in current directory</｜｜DSML｜｜parameter>
+</｜｜DSML｜calls>
+```
+
+字面读这不是语法：一个 `call` 元素、它的 `invoke` 属性是 `name`；再一个带 `name` 属性的 `invoke` 元素。按**位移**读就通了——`invoke name="pwsh"` 变成了 `call invoke="name">pwsh`，`parameter name="command"` 变成了 `invoke name="command"`。
+
+能恢复而不是靠猜，是因为位移的那个词两种读法都指向同一个工具名：属性是装饰也好、是字段名也好，元素正文都是 `pwsh`。
+
+修法两处：
+
+- `parseMisplacedCalls`：工具名取自 `<call invoke="name">正文</…>`，参数取 `<invoke name="KEY">值</…parameter>`。守卫是位移本身——属性键必须是本该做标签名的那个词（`invoke`/`function`/`tool_name`），所以规范的 `<…invoke name="pwsh">` 永远匹配不上这一支。两种写法只差一个词，两条都在真机上活着，守卫不能省。
+- **`call` 必须进 `TAG_NAMES`**。裸分隔符只有在后面跟已知标签名时才算标记，所以以 `call` 开头的块对流式 hold 是隐形的：实测无外壳 + 逐字符流 `calls=0`、竖线进正文。这和第十四条（原生 token）是**同一个教训的第二次**——语法修好了、流式没跟上，等于没修。
+
+### 第十七条：参数被包在一层 `<args>` 里，于是恢复成一个不存在的参数
+
+```
+<｜tool_calls>
+<tool>
+<tool_name>pwsh</tool_name>
+<args>
+<command>Get-ChildItem -Force | …</command>
+<description>List files in current directory</description>
+</args>
+</tool>
+</｜tool_calls>
+```
+
+同级的标签扫描把 `<args>` 当成**一个**参数，值是里面那串标签的**文本**。于是调用带着一个谁家 schema 都不认识的参数发出去，工具回 `required property 'command' is missing`，模型换了四种写法、最后判定 harness 坏了——**第十二条的翻版，只是隔了一层壳**。
+
+这不是从失败日志里看出来的。它是这样量到的：对帧转储统计「恢复出来的调用有哪些键」，40 个调用里 8 个的键集是 `{args}`，其余 32 个是 `{command,description}`。一眼就看出那 8 个是错的。
+
+修法是 `unwrapArguments`，两个条件都必需：
+
+1. 壳必须是**唯一**属性——已经带着 `command` 又有 `<args>` 的，不是被包的调用，是带了个怪参数；
+2. 值必须像参数袋——要么是 `<key>值</key>` 对，要么是 JSON 对象。纯文本是合法参数：`docker_run` 真的有一个叫 `args` 的字符串参数。
+
+两个方言族的入口都串了这一步（`alternateArguments` 与 `parametersOf`），因为同一个错误换写法就会出现。
+
+### 效果
+
+- 同一批真实帧复算：40 个恢复调用全部 `{command,description}`，`{args}` 消失。
+- 反向验证：去掉 `TAG_NAMES` 的 `call` → 逐字符流那条红；去掉 `parseMisplacedCalls` 调用 → 位移用例红；`unwrapArguments` 改回直接返回 → 两条壳用例红。
+- 离线：`dsml dialects` 34 条、`dsml delta split` 13 条，`npm run check` 退出码 0。
+- 帧转储普查（新抓的 2521 帧）：清理残留 0；「有标记无调用」5 个全是流式半截 delta，`rest` 已清空。
