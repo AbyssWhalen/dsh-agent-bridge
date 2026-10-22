@@ -635,8 +635,8 @@ if (lowered.startsWith(stem) && lowered.length - stem.length <= SLACK) return tr
 ## 第七轮状态
 
 - 离线：`npm run check` 退出码 0；`dsml dialects` 36、`dsml delta split` 13、`workbuddy dialect` 4、`qoder notices` 5。
-- 真机：`capturewb4` 14/14 绿（帧转储 45 帧、0 处标记、0 处参数键异常）。
-- 续：`test/workbuddy-dialect.mjs` 7 条、`test/empty-turn.mjs` 6 条、`test/block-pairing.mjs` 3 条进链；空轮在两个驱动上都已改为失败；调用块在超时与断流两个出口上补了闭合。
+- 真机：`capturewb4` 14/14 绿（帧转储 45 帧、0 处标记、0 处参数键异常）；`capturewb5` 12/12 绿（新增空轮/闭合守卫之后，确认没有误杀真实轮次）。
+- 续：`workbuddy-dialect` 7 条、`empty-turn` 6 条、`block-pairing` 3 条、`close-mid-turn` 2 条进链；空轮在两个驱动上都已改为失败；调用块在超时与断流两个出口上补了闭合；`close()` 现在会结束正在跑的那一轮。
 - 未验证：WorkBuddy 是否也会把额度通知当回答（`H-010`，无证据，未改代码）。
 
 ---
@@ -741,4 +741,62 @@ Qoder 侧没有这个问题：`emitCall` 一次性把 `block-start`、两条 `to
 - Qoder 恢复出的调用是一个整体（性质断言）
 
 反向验证：删掉 catch 分支的 `closeCalls()` → 第一条红。
+
+
+---
+
+## 十八、第七轮续三：`close()` 只杀了子进程，没有结束正在跑的那一轮
+
+### 第二十三条：流式过程中关闭会话，消费端永久挂起
+
+宿主在会话结束、或某一轮被放弃时会调用 `close()`。Qoder 侧的实现是：
+
+```js
+async close() {
+  this.#closed = true;
+  await this.#session.close();   // 杀掉子进程
+}
+```
+
+杀掉子进程是对的，但**流式生成器还在等它自己的队列**。子进程死了之后不会再有 `onEvent`，
+队列既没有 `fail` 也没有 `close`，`queue.next()` 那个 promise 就永远悬着。
+
+实测（`_probe/close-midstream.mjs`，用不返回 `result` 的假 runtime）：
+
+```
+close() during a turn -> consumer HUNG in 3006ms
+  chunks=1 failure=none finished=false
+```
+
+已经交付了一个 delta，然后这一轮就不存在了——没有错误、没有结束、没有超时。这是 F-010
+往上挪了一层：那次是子进程死后下一轮不结束，这次是子进程被主动杀掉时当前这一轮不结束。
+
+修法是让每一轮把「怎么结束自己」注册到会话上，`close()` 负责调用它：
+
+```js
+// 轮次开始时
+this.#endTurn = (error) => queue.fail(error);
+
+// finally 里
+this.#endTurn = undefined;
+
+// close()
+this.#endTurn?.(cancellation('qoder: the conversation was closed before the turn finished'));
+this.#endTurn = undefined;
+```
+
+`finally` 里必须清掉，否则 `close()` 会去 fail 一个已经结束的队列——`AsyncQueue.fail` 有
+`if (this.#closed) return` 保护，但留着一个指向死对象的句柄是下一处麻烦的起点。
+
+失败用 `cancellation()` 包装而不是裸 `Error`：这是「调用方停掉了它」，不是「上游坏了」。
+两条错误在日志里必须能分开，否则统计失败率时会把用户主动取消算成上游故障。理由文案也
+要说明是「会话被关闭」，而不是「模型失败」。
+
+### 验证
+
+`test/close-mid-turn.mjs`（2 条）+ 新增 `test/fake-silent-runtime.mjs`（只发一个 delta
+就沉默的假 runtime，这一条没有它测不出来）。
+
+反向验证：把 `close()` 里的 `#endTurn` 调用去掉 → 两条全红。
+
 

@@ -250,6 +250,16 @@ export class QoderConversation {
   #sent = [];
   /** The system prompt `initialize` was last given. */
   #systemPrompt = '';
+  /**
+   * How to end a turn that is in flight, while one is.
+   *
+   * Killing the child is not enough to end a turn: the streaming generator is waiting on its
+   * own queue, and a queue nobody closes is waited on forever. So the turn registers its own
+   * ending here for as long as it runs, and {@link close} calls it. Measured before this
+   * existed: `close()` during a turn left the consumer waiting past 3s with no error and no
+   * end — the reported shape is a hung turn with nothing to act on.
+   */
+  #endTurn;
 
   /**
    * @param {object} options
@@ -650,6 +660,11 @@ export class QoderConversation {
     };
     if (signal !== undefined && !signal.aborted) signal.addEventListener('abort', onAbort, { once: true });
 
+    // Register how this turn ends, so {@link close} can end it while it is in flight. Without
+    // this the child is killed and the queue below is never closed, which leaves the consumer
+    // waiting for an event the dead child can no longer send.
+    this.#endTurn = (error) => queue.fail(error);
+
     let completed = false;
     try {
       // A turn whose caller is already gone must not be sent at all. Failing the
@@ -670,6 +685,7 @@ export class QoderConversation {
       session.onEvent = () => {};
       session.onError = () => {};
       session.endTurn();
+      this.#endTurn = undefined;
       signal?.removeEventListener?.('abort', onAbort);
       // The child's history now ends with this exchange, so recording what was
       // sent is what lets the next turn recognize a straight append. Only a turn
@@ -680,9 +696,18 @@ export class QoderConversation {
     }
   }
 
-  /** Terminate the child process. */
+  /**
+   * Terminate the child process and end any turn still in flight.
+   *
+   * The turn has to be ended explicitly. `#session.close()` kills the child, and a killed
+   * child sends no further event — so without this the streaming generator would sit on a
+   * queue waiting for an event that cannot arrive. The reason names the cause so a caller can
+   * tell "the conversation was closed underneath me" from "the model failed".
+   */
   async close() {
     this.#closed = true;
+    this.#endTurn?.(cancellation('qoder: the conversation was closed before the turn finished'));
+    this.#endTurn = undefined;
     await this.#session.close();
   }
 }
