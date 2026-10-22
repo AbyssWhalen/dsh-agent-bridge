@@ -144,4 +144,5 @@ pwsh -File tools/real-loop-check.ps1 -Profile e2e -Runs 5 -Provider workbuddy -M
 | 每轮都「工具没跑」，但模型说列到了文件 | 工作目录放到了工具看不见的地方（如系统临时目录）。DSH 的文件策略只覆盖它的工作区 |
 | 改了源码但行为没变 | 隔离 profile 里是**拷贝**。`plugins\` 和 `node_modules\` 两处都要同步 |
 | 想看成帧 | 设 `DSH_BRIDGE_DUMP_FRAMES=<jsonl 路径>`（Qoder 驱动）。会写入 prompt 原文，排查完记得关 |
-| 想知道标记里的确切字符 | `node _probe/inspect-frames.mjs <jsonl>`——终端是有损视图，看不出是哪种竖线 |
+| 想知道标记里的确切字符 | `node tools/inspect-frames.mjs <jsonl>`——终端是有损视图，看不出是哪种竖线 |
+| 想留住失败的那一轮 | `pwsh -File tools/real-loop-capture.ps1 -Provider <vendor> -Runs N`——`real-loop-check.ps1` 只数失败次数，这个把每一轮的 transcript 都存下来 |

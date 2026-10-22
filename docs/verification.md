@@ -207,7 +207,10 @@ Qoder 的档位不是读文档读出来的，是一条条问出来的。同一�
 
 ## 八、探针工具（开发期，不进 profile）
 
-`_probe/` 里放开发期的一次性探针与抓到的原始协议快照，不入库、不发版：
+`_probe/` 里放开发期的一次性探针与抓到的原始协议快照，不入库、不发版。**例外**是两个被文档当成复现路径写出来的工具，它们已在 `tools/` 里入库——一条读者打不开的复现路径等于没有复现路径：
+
+- `tools/inspect-frames.mjs`：把帧里的标记逐码点打出来（终端是有损视图）；
+- `tools/real-loop-capture.ps1`：跑 N 轮真循环并留住每一轮 transcript，见第十二节。
 
 - `client-render.mjs`：用桩把浏览器半身渲染成元素树并断言（不需要 DSH、不需要浏览器）；
 - `render-html.mjs`：把同一份 `client.js` 渲成静态页（`out/preview.html` + `preview.png`），并注入一段自测脚本，量出溢出、卡片高度、进度条比例、页签 `aria-selected`——版式问题是可数的，不必靠眼睛；`--only=<n> --shot=<path>` 只渲一张图并按实际高度截屏；
@@ -374,7 +377,9 @@ Get-ChildItem : Cannot find path 'C:\missing-folder' because it does not exist.
 
 前九条都是靠「读代码 + 驱动直连」找出来的。这一轮换了做法：**先把真 DSH 循环跑起来，把每一轮的完整 transcript 都存下来**，再从失败的轮次里反推。理由很直接——第八条缺陷只存在于真循环里，说明驱动直连的覆盖面本来就不够，继续在离线层面找，找的是离线层面才有的问题。
 
-新增 `_probe/real-loop-capture.ps1`：跑 N 轮，每轮种一个带随机 token 的文件名，把 transcript **无论成败**都写进文件，并在文件头记下种的文件名与判定结果。`tools/real-loop-check.ps1` 只数失败次数，不留下证据；而这里恰恰不能重跑——每轮烧真额度，且缺陷是间歇的。
+新增 `tools/real-loop-capture.ps1`（当时写在 `_probe/`，因为文档把它当复现路径引用，后来入库）：跑 N 轮，每轮种一个带随机 token 的文件名，把 transcript **无论成败**都写进文件，并在文件头记下种的文件名与判定结果。`tools/real-loop-check.ps1` 只数失败次数，不留下证据；而这里恰恰不能重跑——每轮烧真额度，且缺陷是间歇的。
+
+这个脚本自己也有个缺陷，是拿它跑 WorkBuddy 时暴露的：`-Model` 的默认值写死成 Qoder 的 `qmodel_38max`，换 vendor 后八轮全部 `model "qmodel_38max" is not in the catalog`——八轮零信息。模型 id 来自各家自己的目录，一个固定默认值不可能对两家都对；改成按 provider 取各自最便宜的模型。
 
 判定仍然是那两条（token 回来 && 没有标记），但多了一列：**失败轮里模型自己的推理**。这一列贡献了后面一半的发现。
 
@@ -450,11 +455,16 @@ Node 对 unhandled rejection 的默认行为是终止进程。也就是说：子
 
 ### 护栏
 
-两个新套件进 `npm test`：
+三个新套件进 `npm test`：
 
 - `test/dsml-dialects.mjs`（21 条）：每一段都是**从真机抓下来的原文抄进去的**，不是照着正则编的。含三种方言与全部退化形状，以及五条「不是调用」的反例（markdown 表格、`<b>`、纯散文、只有 wrapper、`a || b`）。修一个形状补一条，是「先写测试看它红」的顺序做的。
-- `test/dsml-delta-split.mjs`（8 条）：同一批块**按真机抓到的 18 段 delta 边界**送进真驱动，再按**逐字符**送一遍。理由是批处理解析正确不等于流式正确——第十二条的竖线墙就是 `endsWithMarkerPrefix()` 在某个 delta 边界上把 `<` 放了出去。这条测试跑的是驱动，不是复制一份状态机。
+- `test/dsml-delta-split.mjs`（9 条）：同一批块**按真机抓到的 18 段 delta 边界**送进真驱动，再按**逐字符**送一遍。理由是批处理解析正确不等于流式正确——第十二条的竖线墙就是 `endsWithMarkerPrefix()` 在某个 delta 边界上把 `<` 放了出去。这条测试跑的是驱动，不是复制一份状态机。
+- `test/qoder-child-lifecycle.mjs`（6 条）：第十、十一条的护栏，用两个假子进程（按命令自杀 / 在答控制请求时死）驱动真驱动类。最值钱的一条是 `a prompt written to a dead child is refused, not dropped in silence`——它要求会话处于「子进程已死但没人叫它关」这个状态，而 `QoderConversation` 会在写之前换掉死子进程，所以直接从 `QoderSession` 驱动。
+
+反向验证过这三道护栏有牙：去掉 `#ensureChild()` → 红 3 条；把 `#send()` 改回静默 `return` → 红 1 条；把 `flattenTranscript` 换回截断 → `replay-shape` 红 4 条（`npm run test:counterfactual` 自动做并还原）。
 
 ### 效果
 
-同一套 20 轮：修复前 12/20 干净，修复后 19/20。剩下那一轮是竖线上限问题，修完后再测 16 轮全绿。
+同一套 20 轮：修复前 12/20 干净，修复后 19/20。剩下那一轮是竖线上限问题（23 根竖线超了 8 的上限），修完后再测 16 轮 15 绿——唯一那一轮是模型真的退化了，现在报 `the model degenerated into a repetition loop` 而不是刷一屏竖线。
+
+两家都跑了：Qoder 16 轮 15 绿（`capture9`），WorkBuddy 8 轮 8 绿（`capturewb2`）。WorkBuddy 第一遍 8 轮全挂，是上面那个默认模型 id 的问题，不是驱动的问题。

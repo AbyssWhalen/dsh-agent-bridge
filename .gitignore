@@ -7,3 +7,5 @@ package-lock.json
 *.log
 .DS_Store
 Thumbs.db
+.real-loop-capture/
+.real-loop/
