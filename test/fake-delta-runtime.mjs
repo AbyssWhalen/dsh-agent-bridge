@@ -19,7 +19,14 @@
  *   FAKE_RESULT       the `result` frame's text (default: the concatenated deltas)
  */
 import { createInterface } from 'node:readline';
-import { readFileSync } from 'node:fs';
+import { appendFileSync, readFileSync } from 'node:fs';
+
+// The spawn line is the only place a reasoning level can be observed: by the time a message
+// arrives on stdin that decision is already baked into the process. Recorded to the same log
+// the message trace uses, prefixed so a reader can tell the two apart.
+if (process.env.FAKE_RUNTIME_LOG !== undefined) {
+  appendFileSync(process.env.FAKE_RUNTIME_LOG, `ARGV ${JSON.stringify(process.argv.slice(2))}\n`);
+}
 
 const scriptPath = process.env.FAKE_DELTAS_FILE;
 const deltas = scriptPath === undefined ? [] : JSON.parse(readFileSync(scriptPath, 'utf8'));

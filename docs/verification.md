@@ -636,7 +636,7 @@ if (lowered.startsWith(stem) && lowered.length - stem.length <= SLACK) return tr
 
 - 离线：`npm run check` 退出码 0；`dsml dialects` 36、`dsml delta split` 13、`workbuddy dialect` 4、`qoder notices` 5。
 - 真机：`capturewb4` 14/14 绿（帧转储 45 帧、0 处标记、0 处参数键异常）；`capturewb5` 12/12 绿（新增空轮/闭合守卫之后，确认没有误杀真实轮次）。
-- 续：`workbuddy-dialect` 7 条、`empty-turn` 6 条、`block-pairing` 3 条、`close-mid-turn` 2 条、`preflight-cancel` 3 条、`driver-parity` 12 条、`failure-taxonomy` 14 条、`workbuddy-usage` 8 条、`workbuddy-truncation` 6 条、`qoder-truncation` 6 条进链；空轮在两个驱动上都已改为失败；调用块在超时与断流两个出口上补了闭合；`close()` 现在会结束正在跑的那一轮；调用前已取消的轮次不再发出请求；两个驱动的取消错误统一带上 `kind` 与 `name` 两种标记；驱动失败经适配器翻译成宿主的 `LlmError` 类别，真机 `UNKNOWN` 已变 `QUOTA`；WorkBuddy 的缓存 token 不再被算成新输入；两侧的截断都如实报成 `max-tokens`。
+- 续：`workbuddy-dialect` 7 条、`empty-turn` 6 条、`block-pairing` 3 条、`close-mid-turn` 2 条、`preflight-cancel` 3 条、`driver-parity` 12 条、`failure-taxonomy` 14 条、`request-options` 10 条、`workbuddy-usage` 8 条、`workbuddy-truncation` 6 条、`qoder-truncation` 6 条进链；空轮在两个驱动上都已改为失败；调用块在超时与断流两个出口上补了闭合；`close()` 现在会结束正在跑的那一轮；调用前已取消的轮次不再发出请求；两个驱动的取消错误统一带上 `kind` 与 `name` 两种标记；驱动失败经适配器翻译成宿主的 `LlmError` 类别，真机 `UNKNOWN` 已变 `QUOTA`；WorkBuddy 的缓存 token 不再被算成新输入；两侧的截断都如实报成 `max-tokens`；标题轮不再带满档推理、上限真的发到线上。
 - 未验证：WorkBuddy 是否也会把额度通知当回答（`H-010`，无证据，未改代码）。
 
 ---
@@ -1127,4 +1127,70 @@ Qoder 同样处理 → 2 条红。真机 WorkBuddy 8/8 绿。
 两次的抓取脚本用完即删。这个动作值得固定成习惯：**凡是驱动要从上游字段里取值的地方，
 都应该先打印一次真实字段，再写代码。** 帧转储帮不了忙——它只捕获 Qoder 子进程的 stdout，
 WorkBuddy 的 HTTP SSE 根本不在里面，而这次的截图正好证明了这一点。
+
+
+---
+
+## 二十四、继续：适配器丢掉了宿主送来的三个字段
+
+### 第二十九条：`maxTokens` 与 `purpose` 从未到达驱动
+
+查完响应侧（用量、截断），转去查请求侧：宿主把哪些字段交给了适配器，适配器又转交了几个。
+
+`GenerateOptions` 有十一个字段。适配器读了六个（`model`、`reasoningEffort`、`messages`、
+`system`、`tools`、`signal`），其余静默丢弃。这次不靠读类型定义推断——给适配器插一行把收到的
+字段打印出来，跑一次真实 loop：
+
+```
+OPTS purpose=undefined        maxTokens=128000 reasoningEffort="high" model="deepseek-v4.1-flash" tools=24
+OPTS purpose="session-title"  maxTokens=64     reasoningEffort="high" model="deepseek-v4.1-flash" tools=none
+```
+
+于是**每次会话**都有两个请求带着驱动听不见的上限：
+
+1. **标题轮带 `maxTokens: 64`。** 宿主只想要一句标题，驱动一个 `max_tokens` 都没发，模型可以
+   把一个段落塞进标题位——在推理模型上，还是先花掉思考 token 再塞。
+2. **`purpose: "session-title"`。** 参考实现正是靠这个字段把 effort 压成 `off`：
+
+   ```js
+   const effort = options.purpose === "session-title" ? "off" : options.reasoningEffort ?? …
+   ```
+   （`dsh-llm-deepseek`）
+
+   没有这一行，一句标题按调用方的完整推理档位跑。实测标题轮的 `reasoningEffort` 就是 `"high"`。
+
+第三个字段 `toolHistory` 由运行时在到达适配器之前投影完成（适配器声明 `toolUpdate` 时），
+不属于本插件处理范围，未纳入测试。
+
+### 真机前后对比
+
+同一个请求（"给一个排序对话起个短标题"），走真实上游：
+
+```
+before (effort=high, no ceiling): out=104 reasoningTokens=97 reasoningChars=408
+after  (effort=none, max_tokens=64): out=6   reasoningTokens=0  reasoningChars=0
+```
+
+104 token 里 97 个是思考，为了起一个标题名。修好之后 6 个 token，零思考。
+
+顺带把 `off` 的线上拼写也定死了：harness 说 `off`，这个上游说 `none`。实测三种写法
+（`none` 稳定 0 思考；`off` 在 `model: "auto"` 路由下仍产生 35 思考 token；完全不发同样产生
+35）。所以 `off` → `none`，而不是透传也不是丢弃——原来的注释声称"WorkBuddy 丢弃该字段"，
+那句话是错的。
+
+### 验证
+
+`test/request-options.mjs`（10 条）：`maxTokens` 到达驱动、无上限时不臆造、标题轮 effort 为
+`off`、普通轮保留调用方 effort、标题轮同时保住两件事、上限以 `max_tokens` 上到线上、`off`
+以 `none` 上到线上、真实档位原样透传、两字段都没有时都不发、非法上限不转发。
+
+反向验证分别做：去掉 `purpose` 分支 → 2 条红；把 `maxTokens` 改名为不存在的键 → 2 条红。
+真机 WorkBuddy 8/8 绿。
+
+### 方法记录：这一次的类型定义是"提示"不是"证据"
+
+`GenerateOptions` 里写着有 `maxTokens`，只能说明**可以**传；不能说明宿主**真的**传了。
+如果宿主从不传，这次改动就是死代码，而且测试会绿得毫无意义。所以先插桩、先看真机，
+再动手。这已经是本轮第三次用同一招（缓存字段、截断信号、请求字段），值得当成本项目的固定
+动作：**边界上的每一个字段，都要在真机上打印一次再写代码。**
 

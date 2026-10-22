@@ -135,12 +135,19 @@ export class WorkBuddyConversation {
     const list = Array.isArray(messages) ? messages : [];
     const region = this.#client.region;
     const tools = toWireTools(options.tools);
+    const effort = wireEffortLabel(options.effort);
+    const maxTokens =
+      Number.isSafeInteger(options.maxTokens) && options.maxTokens > 0 ? options.maxTokens : undefined;
 
     const body = {
       model: options.model,
       messages: toWireMessages(list, region),
       stream: true,
-      ...(typeof options.effort === 'string' && options.effort.length > 0 ? { reasoning_effort: options.effort } : {}),
+      // A ceiling the caller set is a ceiling the upstream should see. Measured: the harness
+      // sends `maxTokens: 64` on a session-title turn and `128000` on an ordinary one, and until
+      // now neither reached the wire, so "at most 64 tokens" was advice the model never got.
+      ...(maxTokens === undefined ? {} : { max_tokens: maxTokens }),
+      ...(effort === undefined ? {} : { reasoning_effort: effort }),
       // Without this the model has no tool channel and answers with `<tool_call>`
       // prose instead — which is what made this vendor unusable as a coding agent.
       ...(tools === undefined ? {} : { tools, tool_choice: 'auto' })
@@ -763,6 +770,32 @@ function readToolCalls(delta) {
     calls.push({ index, ...(id === undefined ? {} : { id }), ...(name === undefined ? {} : { name }), argumentsDelta });
   }
   return calls;
+}
+
+/**
+ * The upstream's spelling of a reasoning level.
+ *
+ * The harness says `off`; this upstream says `none`. Measured, not assumed — three samples per
+ * spelling on a concrete model:
+ *
+ *     reasoning_effort: "none" → reasoning_tokens 0, no reasoning_content
+ *     reasoning_effort: "off"  → 0 on a model that supports effort, but 35 reasoning tokens
+ *                                when the request went out as `model: "auto"`
+ *     field omitted            → 35 reasoning tokens
+ *
+ * `none` is the OpenAI spelling and the only one that held in both routings, so `off` becomes
+ * `none` rather than being passed through or dropped. Dropping it — which is what this driver
+ * did not do, but what the effort module's comment claimed — leaves thinking on.
+ *
+ * Everything else passes through unchanged; the upstream rejects an unknown level rather than
+ * silently downgrading it, and that loud failure is preferable to guessing here.
+ *
+ * @param {unknown} effort
+ * @returns {string | undefined}
+ */
+function wireEffortLabel(effort) {
+  if (typeof effort !== 'string' || effort.length === 0) return undefined;
+  return effort === 'off' ? 'none' : effort;
 }
 
 /**

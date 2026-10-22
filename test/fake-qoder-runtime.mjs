@@ -18,6 +18,13 @@
 import { createInterface } from 'node:readline';
 import { appendFileSync } from 'node:fs';
 
+// The spawn line is the only place a reasoning level or an emptied tool belt can be observed:
+// by the time a message arrives on stdin those decisions are already baked into the process.
+// Recorded to the same log the message trace uses, prefixed so a reader can tell them apart.
+if (process.env.FAKE_RUNTIME_LOG !== undefined) {
+  appendFileSync(process.env.FAKE_RUNTIME_LOG, `ARGV ${JSON.stringify(process.argv.slice(2))}\n`);
+}
+
 const models = Number(process.env.FAKE_MODELS_FIRST ?? '1') || 1;
 const logFile = process.env.FAKE_RUNTIME_LOG;
 let listings = 0;
