@@ -28,7 +28,7 @@ import {
 } from '../../lib/dsml.js';
 import { assistantProse, flattenConversation, messageText, splitSystem, toolCallsOf } from '../../lib/messages.js';
 import { UpstreamFailure } from './upstream.js';
-import { emptyTurn } from '../../lib/failure.js';
+import { emptyTurn, noticedFailure } from '../../lib/failure.js';
 
 /** How long a stream may go without a frame before it is considered stalled. */
 export const STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
@@ -95,6 +95,7 @@ export class WorkBuddyConversation {
   #client;
   #resolveCredential;
   #logger;
+  #idleTimeoutMs;
   #closed = false;
 
   /**
@@ -102,11 +103,18 @@ export class WorkBuddyConversation {
    * @param {import('./upstream.js').UpstreamClient} options.client
    * @param {() => Promise<object>} options.resolveCredential
    * @param {{debug?: Function, warn?: Function}} [options.logger]
+   * @param {number} [options.idleTimeoutMs] - override for {@link STREAM_IDLE_TIMEOUT_MS};
+   *   exists so a test can reach the stall guard in milliseconds instead of five minutes. No
+   *   caller in this plugin sets it.
    */
   constructor(options) {
     this.#client = options.client;
     this.#resolveCredential = options.resolveCredential;
     this.#logger = options.logger;
+    this.#idleTimeoutMs =
+      Number.isFinite(options.idleTimeoutMs) && options.idleTimeoutMs > 0
+        ? options.idleTimeoutMs
+        : STREAM_IDLE_TIMEOUT_MS;
   }
 
   /** Stateless, so a conversation is usable the moment it exists. */
@@ -187,7 +195,7 @@ export class WorkBuddyConversation {
      */
     let sawFinishReason;
     let stalled = false;
-    let deadline = Date.now() + STREAM_IDLE_TIMEOUT_MS;
+    let deadline = Date.now() + this.#idleTimeoutMs;
 
     /**
      * Whether the caller has already been given something in this turn.
@@ -233,8 +241,15 @@ export class WorkBuddyConversation {
       if (Date.now() < deadline) return;
       stalled = true;
       closeCalls();
-      queue.fail(new Error(`workbuddy: the stream produced nothing for ${STREAM_IDLE_TIMEOUT_MS}ms`));
-    }, Math.min(STREAM_IDLE_TIMEOUT_MS, 5_000));
+      // Marked, not merely described. A bare `Error` carries no kind, so this reached the
+      // harness as `INTERNAL` — which is not in the default retryable set — and a connection
+      // that died mid-stream ended the turn for good while a 429 one second later would have
+      // been retried. `timeout` rather than `transport`: the response arrived and then stopped,
+      // and the session log should be able to tell those apart.
+      queue.fail(
+        noticedFailure(`workbuddy: the stream produced nothing for ${this.#idleTimeoutMs}ms`, 'timeout')
+      );
+    }, Math.min(this.#idleTimeoutMs, 5_000));
     timer.unref?.();
 
     // Text is held back by a marker's length so a call that arrives as text can
@@ -432,7 +447,7 @@ export class WorkBuddyConversation {
               if (payload.length > 0) {
                 const parsed = safeParse(payload);
                 if (parsed !== undefined) {
-                  deadline = Date.now() + STREAM_IDLE_TIMEOUT_MS;
+                  deadline = Date.now() + this.#idleTimeoutMs;
                   const usage = readUsage(parsed);
                   if (usage !== undefined) sawUsage = usage;
                   const cut = readFinishReason(parsed);

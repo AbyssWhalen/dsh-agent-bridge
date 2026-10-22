@@ -636,7 +636,7 @@ if (lowered.startsWith(stem) && lowered.length - stem.length <= SLACK) return tr
 
 - 离线：`npm run check` 退出码 0；`dsml dialects` 36、`dsml delta split` 13、`workbuddy dialect` 4、`qoder notices` 5。
 - 真机：`capturewb4` 14/14 绿（帧转储 45 帧、0 处标记、0 处参数键异常）；`capturewb5` 12/12 绿（新增空轮/闭合守卫之后，确认没有误杀真实轮次）。
-- 续：`workbuddy-dialect` 7 条、`empty-turn` 6 条、`block-pairing` 3 条、`close-mid-turn` 2 条、`preflight-cancel` 3 条、`driver-parity` 12 条、`failure-taxonomy` 14 条、`request-options` 10 条、`purpose-isolation` 5 条、`workbuddy-usage` 8 条、`workbuddy-truncation` 6 条、`qoder-truncation` 6 条进链；空轮在两个驱动上都已改为失败；调用块在超时与断流两个出口上补了闭合；`close()` 现在会结束正在跑的那一轮；调用前已取消的轮次不再发出请求；两个驱动的取消错误统一带上 `kind` 与 `name` 两种标记；驱动失败经适配器翻译成宿主的 `LlmError` 类别，真机 `UNKNOWN` 已变 `QUOTA`；WorkBuddy 的缓存 token 不再被算成新输入；两侧的截断都如实报成 `max-tokens`；标题轮不再带满档推理、上限真的发到线上；`purpose` 请求不再污染对话历史。
+- 续：`workbuddy-dialect` 7 条、`empty-turn` 6 条、`block-pairing` 3 条、`close-mid-turn` 2 条、`preflight-cancel` 3 条、`driver-parity` 12 条、`failure-taxonomy` 14 条、`request-options` 10 条、`purpose-isolation` 5 条、`workbuddy-usage` 8 条、`workbuddy-truncation` 6 条、`qoder-truncation` 6 条、`stall-classification` 5 条、`qoder-stall` 5 条进链；空轮在两个驱动上都已改为失败；调用块在超时与断流两个出口上补了闭合；`close()` 现在会结束正在跑的那一轮；调用前已取消的轮次不再发出请求；两个驱动的取消错误统一带上 `kind` 与 `name` 两种标记；驱动失败经适配器翻译成宿主的 `LlmError` 类别，真机 `UNKNOWN` 已变 `QUOTA`；WorkBuddy 的缓存 token 不再被算成新输入；两侧的截断都如实报成 `max-tokens`；标题轮不再带满档推理、上限真的发到线上；`purpose` 请求不再污染对话历史；静默的流以可重试的 `timeout` 收场，不再挂死。
 - 未验证：WorkBuddy 是否也会把额度通知当回答（`H-010`，无证据，未改代码）。
 
 ---
@@ -1261,4 +1261,66 @@ user: <下一个问题>
 
 另外，`isStraightAppend` 这类指纹机制的存在，说明这个项目早就知道"子进程历史必须与类认知
 一致"。缺陷不是没人想到，是**新入口没有接进已有的保护**。
+
+
+---
+
+## 二十六、继续：静默的流被当成内部错误，静默的 worker 直接挂死
+
+### 第三十一条：WorkBuddy 的静默守卫抛的 `Error` 不带 kind
+
+WorkBuddy 有静默守卫（流 5 分钟没有任何帧就判死）。守卫本身没问题——它是**期限**而不是间隔，
+所以慢但活着的流不会被杀。问题在它抛什么：
+
+```js
+queue.fail(new Error(`workbuddy: the stream produced nothing for ${STREAM_IDLE_TIMEOUT_MS}ms`));
+```
+
+裸 `Error` 上没有任何 kind，`kindOf()` 找不到，于是到达宿主时是 `INTERNAL`。而 `INTERNAL`
+不在默认可重试集合里（`EMPTY_RESPONSE`、`RATE_LIMIT`、`SERVER`、`TIMEOUT`、`TRANSPORT`）。
+**一条断掉的连接把这一轮永久结束，而一秒后的 429 却会自动重试。**
+
+这正是 `lib/failure.js` 存在的意义，走的却是一条它从未覆盖的路径：驱动**自己**抛的错，
+而不是它从上游分类出来的错。补上 `timeout` kind（映射到宿主的 `TIMEOUT`），语义上也更准：
+`transport` 是"根本没到"，这个是"到了然后停了"，会话日志应该能分清。
+
+### 第三十二条：Qoder 根本没有静默守卫
+
+对齐检查时发现的：Qoder 侧完全没有轮次级静默守卫。worker 发一个 delta 然后既不结束也不死，
+这一轮就停在 `await queue.next()`，没有任何东西能唤醒它——没有错误帧，没有 `result`，没有超时。
+
+实测（`fake-silent-runtime.mjs`：发一个 delta，不发 `result`）：消费者 4 秒后仍在等待，而且
+会永远等下去。**这比分类错误的失败更糟**，因为挂死永远到不了重试策略，也永远不会出现在会话
+日志里。
+
+补上同样的守卫，同一个形状：期限而非间隔，每个帧推进它，超时则 `interrupt()` 而不是杀子进程
+（杀了就丢对话，中断还能服务接下来的重试）。
+
+### 验证
+
+`test/stall-classification.mjs`（5 条）、`test/qoder-stall.mjs`（5 条），并在对照表里加第 8 条
+保证——静默必须以可重试的 `timeout` 结束，两驱动各自证明。
+
+反向验证：Qoder 守卫改成恒返回 → 专项 3 条红，对照表也只红 Qoder 那一条（说明它真的在区分
+单侧缺陷）；WorkBuddy 的 kind 去掉 → 专项 3 条红。
+
+### 两条测试自身的坑
+
+**坑一：Never-resolving promise 让 node 直接退出。** 静默测试最初用 `await new Promise(() => {})`
+模拟"连接不再说话"，结果 node 因为没有待处理工作而退出，报"unsettled top-level await"，
+测试根本跑不到断言。真实流有 socket 撑着事件循环；测试里得用一个 ref 的 `setTimeout` 代替。
+
+**坑二：`hang` 与 `stall` 是两种形状。** 对照表里 WorkBuddy 原来用 `hang`（发完帧不发
+`[DONE]`），可那只是迭代器**正常结束**，看起来像"干净但突兀地收尾"，压根触发不了静默守卫。
+必须让 body 停在那儿不结束，才是断连的形状。这一点写进了 `stall` 选项的注释。
+
+### 方法记录
+
+这一条是**靠对齐检查发现的，不是靠读任一驱动发现的**。WorkBuddy 的守卫写了很久，Qoder 一直
+没有——单看任何一个驱动都不会觉得缺什么。第七轮已经吃过这个教训（"同一个规则修在了一个驱动
+上"），所以这轮加了对照表；而对照表要先有一条**保证**才能对比，这条保证是这次新加进去的。
+
+顺序是：先写专项测试证明挂死 → 实现守卫 → 再加进对照表 → 反向验证两条路径都会红。
+`withDeadline` 那层兜底也是必须的：没有守卫时这个断言是**挂住**而不是失败，而挂住的 CI 会被
+读成"基础设施问题"。
 

@@ -84,6 +84,23 @@ const SERVICE_NOTICE_STEMS = [
 const SERVICE_NOTICE_TAIL_SLACK = 120;
 
 /**
+ * How long a turn may go without a single frame before it is declared stalled.
+ *
+ * The WorkBuddy driver has had this guard for a while; this one had none, so a worker that
+ * streamed one delta and then neither finished nor died left the turn in `await queue.next()`
+ * with nothing to wake it. Measured against `fake-silent-runtime.mjs`: the consumer was still
+ * waiting four seconds later, and would have waited forever. A failure the harness can classify
+ * is strictly better than a hang, because a hang never reaches the retry policy and never
+ * appears in the session log.
+ *
+ * It is a *deadline*, not an interval: every frame pushes it forward, so a long turn that keeps
+ * producing events can never be killed by the clock. The number is the same five minutes as the
+ * other driver's, for the same reason — generous enough for a model that thinks for a long time
+ * before its first token, short enough that a dead connection is noticed within a turn.
+ */
+export const TURN_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+
+/**
  * Whether text is still on course to be a service notice.
  *
  * Used as a hold predicate: while it holds, nothing is emitted, because the text may still
@@ -256,6 +273,7 @@ export class QoderConversation {
   /** Everything needed to spawn a replacement child; see {@link #ensureChild}. */
   #spawnOptions;
   #logger;
+  #idleTimeoutMs;
   #closed = false;
   /** Fingerprints of the projected messages the child's history now reflects. */
   #sent = [];
@@ -280,10 +298,17 @@ export class QoderConversation {
    * @param {() => Promise<object>} options.resolveCredential
    * @param {number} [options.catalogTtlMs] - how long a listing is reused; tests
    *   pass a small value instead of waiting out the shipped one.
+   * @param {number} [options.idleTimeoutMs] - how long a turn may go without a frame before it
+   *   is declared stalled; defaults to {@link TURN_IDLE_TIMEOUT_MS}. No caller in this plugin
+   *   sets it — a test uses it to reach the guard in milliseconds instead of minutes.
    * @param {{debug?: Function, info?: Function, warn?: Function}} [options.logger]
    */
   constructor(options) {
     this.#logger = options.logger;
+    this.#idleTimeoutMs =
+      Number.isFinite(options.idleTimeoutMs) && options.idleTimeoutMs > 0
+        ? options.idleTimeoutMs
+        : TURN_IDLE_TIMEOUT_MS;
     this.#spawnOptions = {
       runtimePath: options.runtimePath,
       sdkVersion: options.sdkVersion,
@@ -575,6 +600,15 @@ export class QoderConversation {
     /** Whether the turn has already shown the caller something. */
     const delivered = () => textSeen || reasoningSeen || sawCall;
 
+    /**
+     * The instant this turn must show a sign of life by.
+     *
+     * Pushed forward by every frame in {@link onEvent}, and by sending the prompt. A single
+     * number rather than a per-frame timeout: what matters is time since the last evidence, and
+     * a chain of `setTimeout`s would drift and be harder to follow.
+     */
+    let deadline = Date.now() + this.#idleTimeoutMs;
+
     const session = this.#session;
     // Env-gated frame tracing. The worker's frame shapes are undocumented, so
     // every field this driver reads was observed rather than assumed, and the next
@@ -582,6 +616,9 @@ export class QoderConversation {
     // logger, so it lands wherever the host's other diagnostics do.
     const trace = process.env['QODER_FRAME_DUMP'] === '1' ? this.#logger?.debug : undefined;
     const onEvent = (message) => {
+      // Every frame is a sign of life. A turn that is thinking hard sends `thinking_delta`s the
+      // whole time, so this deadline only ever expires on real silence.
+      deadline = Date.now() + this.#idleTimeoutMs;
       trace?.(`qoder frame: ${JSON.stringify(message).slice(0, 1200)}`);
       if (message?.type === 'stream_event') {
         const event = message.event;
@@ -686,6 +723,20 @@ export class QoderConversation {
     session.onEvent = onEvent;
     session.onError = (error) => queue.fail(error);
 
+    // The stall guard. Checked on a timer rather than per frame because the case it exists for
+    // is precisely the one where no frame arrives to check it on.
+    const stallTimer = setInterval(() => {
+      if (queue.closed) return;
+      if (Date.now() < deadline) return;
+      // The worker is still alive and may recover, so it is interrupted rather than killed: a
+      // killed child loses the conversation, while an interrupted one can service the retry.
+      void session.interrupt();
+      queue.fail(
+        noticedFailure(`qoder: the worker sent nothing for ${this.#idleTimeoutMs}ms`, 'timeout')
+      );
+    }, Math.min(this.#idleTimeoutMs, 5_000));
+    stallTimer.unref?.();
+
     const signal = options.signal;
     const onAbort = () => {
       void session.interrupt();
@@ -715,6 +766,7 @@ export class QoderConversation {
         yield result.value;
       }
     } finally {
+      clearInterval(stallTimer);
       session.onEvent = () => {};
       session.onError = () => {};
       session.endTurn();

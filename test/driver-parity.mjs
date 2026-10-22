@@ -48,7 +48,7 @@ const encoder = new TextEncoder();
  * Drive one Qoder turn.
  *
  * @param {string[]} deltas
- * @param {{signal?: AbortSignal}} [extra]
+ * @param {{signal?: AbortSignal, stopReason?: string, silent?: boolean, idleTimeoutMs?: number}} [extra]
  */
 async function qoder(deltas, extra = {}) {
   if (extra.stopReason !== undefined) process.env.FAKE_STOP_REASON = extra.stopReason;
@@ -59,10 +59,15 @@ async function qoder(deltas, extra = {}) {
   delete process.env.FAKE_SPLIT;
 
   const conversation = new QoderConversation({
-    runtimePath: fileURLToPath(new URL('./fake-delta-runtime.mjs', import.meta.url)),
+    // `silent` is the same worker with the `result` frame withheld, which is how a stuck worker
+    // looks: it says something, then nothing, and never ends the turn on its own.
+    runtimePath: fileURLToPath(
+      new URL(extra.silent === true ? './fake-silent-runtime.mjs' : './fake-delta-runtime.mjs', import.meta.url)
+    ),
     cwd: process.cwd(),
     resolveCredential: async () => ({ token: 'x' }),
-    logger: { debug() {}, info() {}, warn() {} }
+    logger: { debug() {}, info() {}, warn() {} },
+    ...(extra.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: extra.idleTimeoutMs })
   });
 
   const chunks = [];
@@ -79,7 +84,7 @@ async function qoder(deltas, extra = {}) {
     }
   } catch (error) {
     failure = error.message;
-    kind = error.kind;
+    kind = error.kind ?? error.bridgeKind;
   } finally {
     await conversation.close();
   }
@@ -96,7 +101,7 @@ async function qoder(deltas, extra = {}) {
  * Drive one WorkBuddy turn.
  *
  * @param {object[]} frames - SSE payload objects, sent verbatim.
- * @param {{signal?: AbortSignal, hang?: boolean}} [extra]
+ * @param {{signal?: AbortSignal, hang?: boolean, idleTimeoutMs?: number}} [extra]
  */
 async function workbuddy(frames, extra = {}) {
   let requested = false;
@@ -109,6 +114,13 @@ async function workbuddy(frames, extra = {}) {
           body: {
             async *[Symbol.asyncIterator]() {
               for (const frame of frames) yield encoder.encode(`data: ${JSON.stringify(frame)}\n\n`);
+              if (extra.stall === true) {
+                // A body that stops producing without ever closing: the shape a dropped
+                // connection has. Ending the iterator instead — which is what `hang` does —
+                // looks like a clean if abrupt finish, so it cannot exercise a stall guard.
+                await new Promise((resolve) => setTimeout(resolve, 3_000));
+                return;
+              }
               if (extra.hang !== true) yield encoder.encode('data: [DONE]\n\n');
             }
           }
@@ -116,7 +128,8 @@ async function workbuddy(frames, extra = {}) {
       }
     },
     resolveCredential: async () => ({ token: 'x' }),
-    logger: { debug() {}, warn() {} }
+    logger: { debug() {}, warn() {} },
+    ...(extra.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: extra.idleTimeoutMs })
   });
 
   const chunks = [];
@@ -133,7 +146,7 @@ async function workbuddy(frames, extra = {}) {
     }
   } catch (error) {
     failure = error.message;
-    kind = error.kind;
+    kind = error.kind ?? error.bridgeKind;
   }
   return {
     chunks,
@@ -147,6 +160,21 @@ async function workbuddy(frames, extra = {}) {
 
 /** A plain text frame for the WorkBuddy transport. */
 const text = (value) => ({ choices: [{ delta: { content: value }, index: 0 }] });
+
+/**
+ * Await a turn, but report a hang instead of hanging.
+ *
+ * @param {Promise<object>} promise
+ * @param {number} ms
+ * @returns {Promise<object>}
+ */
+async function withDeadline(promise, ms) {
+  const HUNG = Symbol('hung');
+  const timer = new Promise((resolve) => setTimeout(() => resolve(HUNG), ms));
+  const outcome = await Promise.race([promise, timer]);
+  if (outcome === HUNG) throw new Error(`the turn was still waiting after ${ms}ms`);
+  return outcome;
+}
 
 // ══ The parity table ════════════════════════════════════════════════════════════════
 //
@@ -278,6 +306,23 @@ const guarantees = [
         { choices: [{ delta: {}, index: 0, finish_reason: 'length' }] }
       ]);
       assert.equal(finish?.kind, 'max-tokens', `finished as ${JSON.stringify(finish?.kind)}`);
+    }
+  },
+  {
+    // Added after F-038: the stall guard existed on one driver and not the other, and the one
+    // without it did not fail — it waited forever. A hang never reaches the retry policy, so it
+    // is strictly worse than a classified failure, and it is invisible in the session log.
+    name: 'a turn that goes silent ends with a retryable timeout',
+    async qoder() {
+      // Bounded on purpose. Without the guard this driver does not fail, it waits — an unbounded
+      // assertion here would hang the suite rather than report a defect, and a hang in CI reads
+      // as infrastructure trouble rather than as a missing stall guard.
+      const { kind } = await withDeadline(qoder(['working…'], { silent: true, idleTimeoutMs: 120 }), 4_000);
+      assert.equal(kind, 'timeout', `ended as ${JSON.stringify(kind)}`);
+    },
+    async workbuddy() {
+      const { kind } = await workbuddy([text('working…')], { stall: true, idleTimeoutMs: 120 });
+      assert.equal(kind, 'timeout', `ended as ${JSON.stringify(kind)}`);
     }
   }
 ];
