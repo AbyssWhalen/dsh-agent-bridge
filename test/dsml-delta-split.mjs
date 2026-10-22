@@ -116,6 +116,43 @@ const LIVE_BOUNDARIES = [
 for (const split of [false, true]) {
   const label = split ? 'one character at a time' : 'the captured delta boundaries';
 
+  await check(`native control tokens yield a call (${label})`, async () => {
+    // The tokenizer's own reserved tokens, streamed, in both shapes the model writes them.
+    //
+    // **Wrapped** is the live capture. It would pass even without the native spellings in
+    // the marker: `<｜｜DSML｜｜calls>` arrives first and the hold follows the wrapper, so the
+    // native tokens inside never have to be recognisable on their own.
+    //
+    // **Unwrapped** is the case that actually depends on it, and the reason the native
+    // tokens were added to `MARKER`. Nothing before `<｜｜｜｜｜▁begin｜` looks like a marker,
+    // so with one character per delta the opening is released as text and the block is gone
+    // by the time `tool▁sep` makes the shape obvious. Measured without the marker change:
+    // `calls=0`, bars in the text channel.
+    const wrapped = [
+      '<｜｜DSML｜｜calls>',
+      '<｜｜｜｜｜▁begin｜>function<｜tool▁sep｜>pwsh',
+      '```json',
+      '{"command": "Get-ChildItem -Force | Select-Object Name"}',
+      '```<｜｜DSML｜｜call▁end｜>',
+      '</｜｜DSML｜calls>'
+    ].join('\n');
+    const unwrapped = [
+      'Let me look at the files.',
+      '<｜｜｜｜｜▁begin｜>function<｜tool▁sep｜>pwsh',
+      '```json',
+      '{"command": "Get-ChildItem -Force | Select-Object Name"}',
+      '```<｜｜DSML｜｜call▁end｜>'
+    ].join('\n');
+
+    for (const block of [wrapped, unwrapped]) {
+      const { text, calls } = await run([block], split);
+      assert.equal(calls.length, 1, `expected 1 call, got ${calls.length} from ${JSON.stringify(block.slice(0, 40))}`);
+      assert.equal(calls[0].name, 'pwsh');
+      assert.deepEqual(JSON.parse(calls[0].arguments), { command: 'Get-ChildItem -Force | Select-Object Name' });
+      assert.equal(/[\uFF5C\u2581]/u.test(text), false, `markup reached the text channel: ${JSON.stringify(text)}`);
+    }
+  });
+
   await check(`an interposed wrapper yields a call (${label})`, async () => {
     const { text, calls } = await run(LIVE_BOUNDARIES, split);
     assert.equal(calls.length, 1, `expected 1 call, got ${calls.length}`);

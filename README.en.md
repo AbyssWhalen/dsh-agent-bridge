@@ -212,19 +212,22 @@ With real tools present the "you have no tools" preamble is withheld: it contrad
 
 ### Recovering calls that arrive as text
 
-Upstream models occasionally lose their structured call channel and write the call **into the content stream**. The plugin intercepts and reconstructs them instead of streaming markup to the screen. Three dialects have been captured from live accounts:
+Upstream models occasionally lose their structured call channel and write the call **into the content stream**. The plugin intercepts and reconstructs them instead of streaming markup to the screen. Four shapes have been captured from live accounts:
 
 ```
 <｜｜DSML｜｜invoke name="pwsh">     ← native DSML; bar counts and the `DSML` letters both drift
 <｜tool_name>pwsh</｜tool_name>      ← invented by the model; followed by <command>…</command>
 <｜tool_call><name>…</name><arguments>{…}</arguments></tool_call>
+<｜｜｜▁begin｜>function<｜tool▁sep｜>pwsh  ```json {…} ```  ← the tokenizer's own control tokens
 ```
+
+The fourth is not a dialect a model invented: those are its **native function-calling tokens** arriving in the content channel (`▁` is U+2581, the glyph a tokenizer uses for a space). Its arguments are a fenced JSON object, which makes it the easiest of the four to recover.
 
 Detection is deliberately permissive and removal deliberately strict:
 
-- up to 32 bars, the `DSML` letters optional, and the word `parameter` optional on an **opening** tag — every one of those shapes was observed, not imagined;
+- up to 32 bars, the `DSML` letters optional, the word `parameter` optional on an **opening** tag, and `_` interchangeable with U+2581 — every one of those shapes was observed, not imagined;
 - a bare run of bars only counts as a delimiter when a known tag name follows it, so `a || b`, markdown tables and `<b>bold</b>` pass through untouched;
-- a call whose arguments could not be recovered is **not executed**. Showing the raw block beats calling a tool with `{}` — on a live account that mistake made the model retry six times and then declare the harness broken.
+- a call whose arguments could not be recovered is **not executed**. Showing the raw block beats calling a tool with `{}` — on a live account that mistake made the model retry six times and then declare the harness broken. A truncated JSON fence is treated the same way.
 
 A turn where the model repeats `｜` until the budget runs out (500 bars was observed) counts as a degenerate turn: it fails with the reason named rather than rendering the bars as an answer.
 

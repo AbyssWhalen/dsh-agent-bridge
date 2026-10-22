@@ -223,7 +223,65 @@ recovers('tool_call with argument children that carry a name', TOOL_CALL_ARGUMEN
   description: 'Print the working directory'
 });
 
-// ── 3. Nothing must be invented where there is no call ───────────────────────────────
+// ── 3. The tokenizer's own control tokens, rendered to text ──────────────────────────
+//
+// Live, capture10 run 6. Not a dialect the model invented — these are the model's *native*
+// function-calling tokens (`<|begin_of_tool_call|>`, `<|tool_sep|>`, `<|end_of_tool_call|>`)
+// arriving in the content stream, with `▁` (U+2581, the glyph a tokenizer uses for a space)
+// standing in for the underscores. The bar is the same U+FF5C as everywhere else.
+//
+//   <｜｜｜｜｜▁begin｜>function<｜tool▁sep｜>pwsh
+//   ```json
+//   {"command": "Get-ChildItem -Force | Select-Object Name, Mode | Format-Table -AutoSize"}
+//   ```<｜｜DSML｜｜call▁end｜>
+//
+// The arguments are a fenced JSON object, which makes this the *easiest* dialect to
+// recover — it is already an argument bag, no `parameter` tags to mis-read. It went
+// unrecognised for exactly one reason: nobody had seen it before.
+const NATIVE_TOKENS = [
+  '<｜｜DSML｜｜calls>',
+  '<｜｜｜｜｜▁begin｜>function<｜tool▁sep｜>pwsh',
+  '```json',
+  '{"command": "Get-ChildItem -Force | Select-Object Name, Mode | Format-Table -AutoSize", "description": "列出当前目录中的文件"}',
+  '```<｜｜DSML｜｜call▁end｜>',
+  '</｜｜DSML｜calls>'
+].join('\n');
+
+recovers('native tool tokens with a fenced json argument bag', NATIVE_TOKENS, 'pwsh', {
+  command: 'Get-ChildItem -Force | Select-Object Name, Mode | Format-Table -AutoSize',
+  description: '列出当前目录中的文件'
+});
+
+check('the native tokens are spelled with underscores and nothing else', () => {
+  // The same sequence as a tokenizer would emit it, without the DSML wrapper and with
+  // ASCII `_`: a model that is not quoting the plugin's dialect still has to be read.
+  const plain = [
+    '<|begin_of_tool_call|>function<|tool_sep|>glob',
+    '```json',
+    '{"pattern": "**/*.md"}',
+    '```<|end_of_tool_call|>'
+  ].join('\n');
+  assert.equal(hasNativeLeak(plain), true, 'the plain token form was not detected');
+  const { calls } = parseLeakedCalls(plain);
+  assert.equal(calls.length, 1, `expected 1 call, got ${calls.length}`);
+  assert.equal(calls[0].name, 'glob');
+  assert.deepEqual(JSON.parse(calls[0].arguments), { pattern: '**/*.md' });
+});
+
+check('an unparseable argument fence runs nothing but still hides the markup', () => {
+  // Half a JSON object: the model was cut off mid-argument. Executing `{}` here would run
+  // a tool with no arguments — the F-012 failure again, one dialect over.
+  const truncated = [
+    '<｜｜｜｜｜▁begin｜>function<｜tool▁sep｜>pwsh',
+    '```json',
+    '{"command": "Get-Child',
+    '</｜｜DSML｜calls>'
+  ].join('\n');
+  const { calls } = parseLeakedCalls(truncated);
+  assert.deepEqual(calls, [], 'a call was invented from an incomplete argument bag');
+});
+
+// ── 4. Nothing must be invented where there is no call ───────────────────────────────
 check('ordinary prose with ASCII pipes is not a call', () => {
   const prose = 'Use `a || b` in JavaScript, and `cmd | tee` in a shell. The table below:\n\n| a | b |\n|---|---|\n';
   assert.equal(hasNativeLeak(prose), false);
@@ -254,6 +312,39 @@ check('a tool_name with no arguments is a legal parameterless call', () => {
 });
 
 // ── 4. History hygiene ──────────────────────────────────────────────────────────────
+check('a closing tag repeated to the budget and truncated mid-tag leaves nothing behind', () => {
+  // Live: after a complete call, the model repeated `</｜｜DSML｜parameter>` dozens of times
+  // and ran out of budget inside the last one. `stripLeak` removes this from replayed
+  // history — an assistant turn carrying markup comes back as an example to copy — but the
+  // residue rule required a closing `>`, so the truncated tail survived on its own line.
+  // Measured across three frame dumps: eight strings kept `</｜｜DSML｜` after stripping.
+  const repeated = '<｜｜DSML｜｜calls>\n<｜｜DSML｜invoke name="pwsh">\n'
+    + '<｜｜DSML｜parameter name="command">Get-Location</｜｜DSML｜parameter>\n'
+    + '</｜｜DSML｜parameter>\n'.repeat(60)
+    + '</｜｜DSML｜param';
+  const stripped = stripLeak(repeated);
+  assert.equal(/[\uFF5C\u2581]/u.test(stripped), false, `bars survived: ${JSON.stringify(stripped.slice(-80))}`);
+});
+
+check('a closing tag truncated at the very end of the string leaves nothing behind', () => {
+  const tail = '<｜｜DSML｜｜calls>\n<｜｜DSML｜invoke name="pwsh">\n'
+    + '<｜｜DSML｜parameter name="command">Get-Location</｜｜DSML｜parameter>\n'
+    + '</｜｜DSML｜param';
+  assert.equal(/[\uFF5C\u2581]/u.test(stripLeak(tail)), false);
+});
+
+check('the closing-tag repetition is still exactly one call', () => {
+  // The repetition must not be read as sixty parameterless calls, and the one real call
+  // must survive it.
+  const block = '<｜｜DSML｜｜calls>\n<｜｜DSML｜invoke name="pwsh">\n'
+    + '<｜｜DSML｜parameter name="command">Get-Location</｜｜DSML｜parameter>\n'
+    + '</｜｜DSML｜invoke>\n'
+    + '</｜｜DSML｜parameter>\n'.repeat(60);
+  const { calls } = parseLeakedCalls(block);
+  assert.equal(calls.length, 1, `expected 1 call, got ${calls.length}`);
+  assert.deepEqual(JSON.parse(calls[0].arguments), { command: 'Get-Location' });
+});
+
 check('every dialect strips out of replayed history', () => {
   for (const block of [SEVEN_BARS, INTERPOSED, TOOL_CALL_JSON, TOOL_NAME_SIBLINGS, TOOL_CALL_ARGUMENT]) {
     const stripped = stripLeak(block);
