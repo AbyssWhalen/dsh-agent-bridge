@@ -35,6 +35,7 @@ import {
   parseLeakedCalls,
   stripLeak
 } from '../../lib/dsml.js';
+import { emptyTurn, noticedFailure } from '../../lib/failure.js';
 import { appendPrompt, flattenTranscript, isStraightAppend, messageFingerprint, splitSystem } from '../../lib/messages.js';
 
 /**
@@ -59,11 +60,15 @@ import { appendPrompt, flattenTranscript, isStraightAppend, messageFingerprint, 
  *
  * Matching is anchored at the start, so an ordinary answer that merely mentions the words
  * (`The daily usage limit for Chat is 2900 credits.`) is still an answer.
+ *
+ * `kind` is the failure the notice stands for, in this driver's vocabulary — see
+ * {@link serviceNotice}. The allowance one is `quota`, not a rate limit: no amount of retrying
+ * clears it before the counter resets.
  */
 const SERVICE_NOTICE_STEMS = [
-  'the model is busy and could not complete the request',
-  'queuing failed',
-  "you've reached your daily usage limit"
+  { stem: 'the model is busy and could not complete the request', kind: 'soft_rate' },
+  { stem: 'queuing failed', kind: 'soft_rate' },
+  { stem: "you've reached your daily usage limit", kind: 'quota' }
 ];
 
 /**
@@ -96,7 +101,7 @@ const SERVICE_NOTICE_TAIL_SLACK = 120;
  */
 function couldBeServiceNotice(held) {
   const lowered = held.trimStart().toLowerCase();
-  for (const stem of SERVICE_NOTICE_STEMS) {
+  for (const { stem } of SERVICE_NOTICE_STEMS) {
     if (stem.startsWith(lowered)) return true;
     if (lowered.startsWith(stem) && lowered.length - stem.length <= SERVICE_NOTICE_TAIL_SLACK) return true;
   }
@@ -104,18 +109,24 @@ function couldBeServiceNotice(held) {
 }
 
 /**
- * Whether text is a service notice.
+ * Whether text is a service notice, and which kind of failure it stands for.
+ *
+ * The kind travels with the stem because the two notices mean different things to the caller.
+ * "Busy, try again" is transient and worth retrying; "you are out of Chat for today" is not —
+ * retrying spends nothing but time and cannot succeed before tomorrow. Reporting both as one
+ * unclassified failure is what let the second one sit in the harness log as an anonymous
+ * error, and it is what a reader of that log cannot tell apart from a genuine fault.
  *
  * Nothing held is not a notice: the empty string is a prefix of every stem, so without the
  * length guard an empty reply would be reported as an upstream failure with no message.
  *
  * @param {string} held
- * @returns {boolean}
+ * @returns {{stem: string, kind: string} | undefined}
  */
-function isServiceNotice(held) {
+function serviceNotice(held) {
   const lowered = held.trim().toLowerCase();
-  if (lowered.length === 0) return false;
-  return SERVICE_NOTICE_STEMS.some((stem) => lowered.startsWith(stem));
+  if (lowered.length === 0) return undefined;
+  return SERVICE_NOTICE_STEMS.find((notice) => lowered.startsWith(notice.stem));
 }
 
 /**
@@ -625,8 +636,9 @@ export class QoderConversation {
         // or a notice, so it is released before the turn closes.
         settleText();
         if (!released) {
-          if (isServiceNotice(noticeProbe)) {
-            queue.fail(new Error(`qoder: ${noticeProbe.trim()}`));
+          const notice = serviceNotice(noticeProbe);
+          if (notice !== undefined) {
+            queue.fail(noticedFailure(`qoder: ${noticeProbe.trim()}`, notice.kind));
             return;
           }
           if (noticeProbe.length > 0) emitText(noticeProbe, 0);
@@ -642,7 +654,7 @@ export class QoderConversation {
         // not at all. Finished as `stop`, an empty turn is a blank answer the caller cannot
         // act on, and the same indistinguishability from a refusal the comment above names.
         if (!delivered()) {
-          queue.fail(new Error('qoder: the runtime finished the turn without producing any content'));
+          queue.fail(emptyTurn('qoder: the runtime finished the turn without producing any content'));
           return;
         }
         queue.push({ type: 'finish', reason: { kind: sawCall ? 'tool-calls' : 'stop' } });

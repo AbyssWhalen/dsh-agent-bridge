@@ -636,7 +636,7 @@ if (lowered.startsWith(stem) && lowered.length - stem.length <= SLACK) return tr
 
 - 离线：`npm run check` 退出码 0；`dsml dialects` 36、`dsml delta split` 13、`workbuddy dialect` 4、`qoder notices` 5。
 - 真机：`capturewb4` 14/14 绿（帧转储 45 帧、0 处标记、0 处参数键异常）；`capturewb5` 12/12 绿（新增空轮/闭合守卫之后，确认没有误杀真实轮次）。
-- 续：`workbuddy-dialect` 7 条、`empty-turn` 6 条、`block-pairing` 3 条、`close-mid-turn` 2 条、`preflight-cancel` 3 条、`driver-parity` 12 条进链；空轮在两个驱动上都已改为失败；调用块在超时与断流两个出口上补了闭合；`close()` 现在会结束正在跑的那一轮；调用前已取消的轮次不再发出请求；两个驱动的取消错误统一带上 `kind` 与 `name` 两种标记。
+- 续：`workbuddy-dialect` 7 条、`empty-turn` 6 条、`block-pairing` 3 条、`close-mid-turn` 2 条、`preflight-cancel` 3 条、`driver-parity` 12 条、`failure-taxonomy` 14 条进链；空轮在两个驱动上都已改为失败；调用块在超时与断流两个出口上补了闭合；`close()` 现在会结束正在跑的那一轮；调用前已取消的轮次不再发出请求；两个驱动的取消错误统一带上 `kind` 与 `name` 两种标记；驱动失败经适配器翻译成宿主的 `LlmError` 类别，真机 `UNKNOWN` 已变 `QUOTA`。
 - 未验证：WorkBuddy 是否也会把额度通知当回答（`H-010`，无证据，未改代码）。
 
 ---
@@ -887,4 +887,104 @@ error.kind = 'cancelled';
 
 这张表的价值不在现在全绿，而在于**下次改任一驱动时，另一侧会自动被问到同一个问题**。
 新增一条保证只要在数组里加一项，两个驱动各写一个函数；漏写一个，那一半直接缺失。
+
+
+---
+
+## 二十一、重启后继续：错误在到达宿主时失去了意义
+
+### 第二十六条：任何驱动失败都被宿主记成 `UNKNOWN`
+
+重启后第一件事是复测。F-025 的修复确实生效了——额度通知不再被当成回答，而是报成错误。但真机输出是：
+
+```
+dsh: UNKNOWN: qoder: You've reached your daily usage limit for Chat. ...
+```
+
+`UNKNOWN` 是宿主对「它不认识的错误」的兜底。翻 `dsh-agent-loop` 的源码，这个字面量只出现在一处：
+
+```js
+turnEnds = { kind: 'error', error: error instanceof LlmError ? error.failure : { message, code: 'UNKNOWN' } };
+```
+
+也就是说：**错误只要不是 `LlmError`，宿主就把它的类别丢掉**，只留一句文本。丢掉的后果有两个：
+
+1. **重试失效。** `dsh-llm-retry` 只按 `failure.code` 匹配 `retryableCodes`，默认是
+   `EMPTY_RESPONSE`、`RATE_LIMIT`、`SERVER`、`TIMEOUT`、`TRANSPORT`。未分类的错误一律不重试——
+   哪怕它正是重试机制存在的理由。
+2. **日志不可读。** 429、会话失效、余额耗尽、上游真的挂了，四种事故事后全是同一个词。
+
+这一条与前面二十几条都不同：前面是「驱动内部的行为错了」，这条是**驱动与宿主之间的接口丢了信息**。
+两个驱动发出的 `UpstreamFailure`（带 `kind`）从来没有被翻译成宿主能读的东西。
+
+### 修法：把翻译放在唯一的接缝上
+
+驱动不该认识宿主的类型——它们也被 `tools/` 和测试直接驱动，那里引入 `@deepseek-ai/dsh-llm`
+是白背依赖。适配器是最后一个同时懂两种词汇的地方，所以映射表放在那里：
+
+- `lib/failure.js`：`KIND_TO_CODE` 表 + `kindOf()` + `codeFor()` + `emptyTurn()` + `noticedFailure()`
+- `lib/llm-error.js`：`toLlmError()`，在 `adapter.stream()` 的 `catch` 里调用一次
+
+映射不是随手填的。右列必须落在宿主认识的集合里：
+
+| 驱动 kind | 宿主 code | 宿主会不会自动重试 |
+| --- | --- | --- |
+| `soft_rate` | `RATE_LIMIT` | 会 |
+| `server` | `SERVER` | 会 |
+| `transport` | `TRANSPORT` | 会 |
+| `empty_turn` | `EMPTY_RESPONSE` | 会 |
+| `hard_credit` / `quota` | `QUOTA` | 不会 |
+| `session_dead` | `INVALID_CREDENTIAL` | 不会 |
+| `cancelled` | `ABORTED` | 不会 |
+| `not_found` / `client` | `NOT_FOUND` / `BAD_REQUEST` | 不会 |
+| 未识别 | `INTERNAL` | 不会 |
+
+最后一行是有意的保守：对一个谁也不认识的错误猜「这是暂时的」，会把确定性 bug 变成无限重试。
+
+### 顺带修掉的第二半：额度通知自己也没有 kind
+
+映射表就位后，真机输出从 `UNKNOWN` 变成 `INTERNAL`——好了一步，但仍然是错的。因为额度通知
+是一条**文本**，不是状态码，驱动把它识别出来后用的是裸 `Error`：
+
+```js
+queue.fail(new Error(`qoder: ${noticeProbe.trim()}`));
+```
+
+于是 `SERVICE_NOTICE_STEMS` 从字符串数组改成带 kind 的表，并且两类通知给了不同的种类：
+
+- 「模型忙 / 排队失败」→ `soft_rate`：等一会儿可能就好，值得重试
+- 「今日 Chat 额度用尽」→ `quota`：等到明天之前重试多少次都没用
+
+这半条的教训是：**「识别出来了」和「说清是什么」是两件事**。F-025 只做了前者。
+
+### 真机验证
+
+```
+修前：dsh: UNKNOWN: qoder: You've reached your daily usage limit for Chat. ...
+中途：dsh: INTERNAL: qoder: You've reached your daily usage limit for Chat. ...
+修后：dsh: QUOTA: qoder: You've reached your daily usage limit for Chat. ...
+```
+
+### 验证
+
+`test/failure-taxonomy.mjs`（14 条）：7 种 kind 逐一映射、消息不被改写、取消不是可重试项、
+`EMPTY_RESPONSE` 可重试、未识别错误归 `INTERNAL`、额度通知端到端到 `QUOTA`、健康轮不受影响。
+`test/qoder-notices.mjs` 增加 2 条：额度通知是 `quota` 而非 `soft_rate`、忙通知是 `soft_rate`。
+
+反向验证两处：`toLlmError` 换回 `throw error` → 前 7 条全红；通知的 kind 改成 `soft_rate`
+→ 两个套件各红一条。
+
+### 一个连带的坑：清理旧副本时只同步了一半
+
+排查导入失败时发现 `dsh: warning: 2 entries did not activate … failed to import`。不是代码问题：
+e2e 临时 profile 有 `plugins/` 和 `node_modules/` 两份副本，我新建了 `lib/failure.js` 却只
+把它同步进了 `plugins/` 那份，`node_modules/` 那份还是旧的，于是 `import` 找不到文件。
+
+这个坑值得记，因为**新建文件**时它才出现：只改已有文件时两份副本都会因为覆盖而一致。以后同步
+必须两份都写，`tools/sync.ps1` 现在的行为是对的（99 文件校验通过，两份都有新文件）。
+
+而且这次排查本身又踩了同一个旧坑：诊断探针放在 `_probe/`，用 `./fake-delta-runtime.mjs`
+解析假 runtime，路径不存在 → 运行时启动即退出 → 报 `worker runtime exited before replying`。
+连"纯文本轮次"都失败，才意识到是路径而不是代码。这是第三次踩，说明规则要更硬：**探针要么放
+`test/`，要么所有相对路径都按 `import.meta.url` 显式拼到 `test/`。**
 

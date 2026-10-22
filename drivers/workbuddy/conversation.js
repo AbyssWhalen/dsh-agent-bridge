@@ -28,6 +28,7 @@ import {
 } from '../../lib/dsml.js';
 import { assistantProse, flattenConversation, messageText, splitSystem, toolCallsOf } from '../../lib/messages.js';
 import { UpstreamFailure } from './upstream.js';
+import { emptyTurn } from '../../lib/failure.js';
 
 /** How long a stream may go without a frame before it is considered stalled. */
 export const STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
@@ -517,7 +518,7 @@ export class WorkBuddyConversation {
       // indistinguishable from a refusal, and a refusal the user cannot see is worse than a
       // failure they can read.
       if (!delivered()) {
-        throw new Error('workbuddy: the upstream finished the turn without producing any content');
+        throw emptyTurn('workbuddy: the upstream finished the turn without producing any content');
       }
       if (sawUsage !== undefined) yield { type: 'usage', usage: sawUsage };
       yield { type: 'finish', reason: { kind: sawToolCall ? 'tool-calls' : 'stop' } };

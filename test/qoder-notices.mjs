@@ -64,17 +64,22 @@ async function turn(deltas) {
 
   const chunks = [];
   let failure;
+  let kind;
   try {
     for await (const chunk of conversation.send([{ role: 'user', text: 'go' }], { model: 'fake-model-1', effort: 'low' })) {
       chunks.push(chunk);
-      if (chunk.type === 'error') failure = chunk.error?.message;
+      if (chunk.type === 'error') {
+        failure = chunk.error?.message;
+        kind = chunk.error?.kind ?? chunk.error?.bridgeKind;
+      }
     }
   } catch (error) {
     failure = error.message;
+    kind = error.kind ?? error.bridgeKind;
   } finally {
     await conversation.close();
   }
-  return { text: chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join(''), failure };
+  return { text: chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join(''), failure, kind };
 }
 
 // ── 1. Notices must not become answers ──────────────────────────────────────────────
@@ -112,6 +117,21 @@ await check('a sentence that merely starts with You is not a notice', async () =
   const { text, failure } = await turn([prose]);
   assert.equal(text, prose, 'a real answer was swallowed');
   assert.equal(failure, undefined, `a real answer was failed: ${failure}`);
+});
+
+// ── 3. Each notice must say what it is, not just that something went wrong ──────────
+await check('the daily-limit notice is a quota failure, not a rate limit', async () => {
+  // The two notices are not the same news. `soft_rate` is retried by the harness; `quota` is
+  // not, because no retry clears an allowance before it resets. Reporting the allowance one as
+  // an unclassified error left it unreadable in the session log and cost the notification its
+  // meaning on the way out — measured live as `dsh: INTERNAL: qoder: You've reached …`.
+  const { kind } = await turn([DAILY_LIMIT]);
+  assert.equal(kind, 'quota', `the allowance notice reported kind ${JSON.stringify(kind)}`);
+});
+
+await check('a busy notice is a rate-limit failure, which the harness retries', async () => {
+  const { kind } = await turn([BUSY]);
+  assert.equal(kind, 'soft_rate', `the busy notice reported kind ${JSON.stringify(kind)}`);
 });
 
 await new Promise((resolve) => setTimeout(resolve, 100));
