@@ -748,21 +748,59 @@ function readToolCalls(delta) {
 /**
  * Token usage from one chunk, when the upstream reports it.
  *
+ * The upstream's object carries the same facts under several names and one convention that has
+ * to be undone. Measured from a live turn, not inferred:
+ *
+ *     {"prompt_tokens":28,"completion_tokens":21,
+ *      "completion_tokens_details":{"reasoning_tokens":18,"cached_tokens":0},
+ *      "prompt_tokens_details":{"cached_tokens":0},
+ *      "prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":28,
+ *      "cache_read_input_tokens":0,"cache_creation_input_tokens":0,
+ *      "prompt_cache_write_tokens":0,"cached_tokens":0}
+ *
+ * `prompt_tokens` **includes** the cached ones (the OpenAI convention this upstream follows).
+ * The harness reads `inputTokens` as *uncached* input — `dsh-token-meter` does
+ * `uncachedInputTokens: usage.inputTokens` and adds the cache buckets itself to get the pressure
+ * total. Passing `prompt_tokens` through unchanged therefore counted every cached token as fresh
+ * input and reported a cache-hit rate of zero on every turn, which is the one number that tells
+ * a user whether their prefix is being reused. The pressure total stayed right, cached input
+ * being counted once either way — which is why this never surfaced as a failure.
+ *
+ * A cached count larger than `prompt_tokens` cannot happen; trusting it would produce negative
+ * input, which the harness's non-negative schema rejects outright, so the whole cache reading is
+ * dropped rather than half-applied.
+ *
  * @param {object} chunk
- * @returns {{inputTokens?: number, outputTokens?: number, reasoningTokens?: number} | undefined}
+ * @returns {{inputTokens?: number, outputTokens?: number, reasoningTokens?: number,
+ *   cacheReadTokens?: number, cacheWriteTokens?: number} | undefined}
  */
 function readUsage(chunk) {
   const usage = chunk.usage;
   if (usage === null || typeof usage !== 'object') return undefined;
   const pick = (value) => (typeof value === 'number' && Number.isFinite(value) ? value : undefined);
-  const input = pick(usage.prompt_tokens) ?? pick(usage.input_tokens);
+  const prompt = pick(usage.prompt_tokens) ?? pick(usage.input_tokens);
   const output = pick(usage.completion_tokens) ?? pick(usage.output_tokens);
   const reasoning = pick(usage.reasoning_tokens) ?? pick(usage.completion_tokens_details?.reasoning_tokens);
-  if (input === undefined && output === undefined) return undefined;
+  if (prompt === undefined && output === undefined) return undefined;
+
+  // Four spellings of "how much of the prompt was already cached", most specific first. The
+  // upstream sends all of them; the nested one is the one it means.
+  const cached =
+    pick(usage.prompt_tokens_details?.cached_tokens) ??
+    pick(usage.cached_tokens) ??
+    pick(usage.prompt_cache_hit_tokens) ??
+    pick(usage.cache_read_input_tokens);
+  const written = pick(usage.prompt_cache_write_tokens) ?? pick(usage.cache_creation_input_tokens);
+
+  const usable = prompt !== undefined && cached !== undefined && cached <= prompt ? cached : undefined;
+  const uncached = usable === undefined ? prompt : prompt - usable;
+
   return {
-    ...(input === undefined ? {} : { inputTokens: input }),
+    ...(uncached === undefined ? {} : { inputTokens: uncached }),
     ...(output === undefined ? {} : { outputTokens: output }),
-    ...(reasoning === undefined ? {} : { reasoningTokens: reasoning })
+    ...(reasoning === undefined ? {} : { reasoningTokens: reasoning }),
+    ...(usable === undefined || usable === 0 ? {} : { cacheReadTokens: usable }),
+    ...(written === undefined || written === 0 ? {} : { cacheWriteTokens: written })
   };
 }
 

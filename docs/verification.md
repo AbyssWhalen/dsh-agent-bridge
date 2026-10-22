@@ -636,7 +636,7 @@ if (lowered.startsWith(stem) && lowered.length - stem.length <= SLACK) return tr
 
 - 离线：`npm run check` 退出码 0；`dsml dialects` 36、`dsml delta split` 13、`workbuddy dialect` 4、`qoder notices` 5。
 - 真机：`capturewb4` 14/14 绿（帧转储 45 帧、0 处标记、0 处参数键异常）；`capturewb5` 12/12 绿（新增空轮/闭合守卫之后，确认没有误杀真实轮次）。
-- 续：`workbuddy-dialect` 7 条、`empty-turn` 6 条、`block-pairing` 3 条、`close-mid-turn` 2 条、`preflight-cancel` 3 条、`driver-parity` 12 条、`failure-taxonomy` 14 条进链；空轮在两个驱动上都已改为失败；调用块在超时与断流两个出口上补了闭合；`close()` 现在会结束正在跑的那一轮；调用前已取消的轮次不再发出请求；两个驱动的取消错误统一带上 `kind` 与 `name` 两种标记；驱动失败经适配器翻译成宿主的 `LlmError` 类别，真机 `UNKNOWN` 已变 `QUOTA`。
+- 续：`workbuddy-dialect` 7 条、`empty-turn` 6 条、`block-pairing` 3 条、`close-mid-turn` 2 条、`preflight-cancel` 3 条、`driver-parity` 12 条、`failure-taxonomy` 14 条、`workbuddy-usage` 8 条进链；空轮在两个驱动上都已改为失败；调用块在超时与断流两个出口上补了闭合；`close()` 现在会结束正在跑的那一轮；调用前已取消的轮次不再发出请求；两个驱动的取消错误统一带上 `kind` 与 `name` 两种标记；驱动失败经适配器翻译成宿主的 `LlmError` 类别，真机 `UNKNOWN` 已变 `QUOTA`；WorkBuddy 的缓存 token 不再被算成新输入。
 - 未验证：WorkBuddy 是否也会把额度通知当回答（`H-010`，无证据，未改代码）。
 
 ---
@@ -987,4 +987,69 @@ e2e 临时 profile 有 `plugins/` 和 `node_modules/` 两份副本，我新建�
 解析假 runtime，路径不存在 → 运行时启动即退出 → 报 `worker runtime exited before replying`。
 连"纯文本轮次"都失败，才意识到是路径而不是代码。这是第三次踩，说明规则要更硬：**探针要么放
 `test/`，要么所有相对路径都按 `import.meta.url` 显式拼到 `test/`。**
+
+
+---
+
+## 二十二、继续：缓存 token 被当成新输入，命中率永远是 0
+
+### 第二十七条：`readUsage` 只读三个字段，上游报的缓存事实全部丢弃
+
+上一轮把失败翻译修好之后，接着查另一处接口：`usage` chunk。`dsh-token-meter` 的算法是
+
+```js
+uncachedInputTokens: usage.inputTokens   // 期望这里已经是「未命中缓存」的输入
+cacheReadTokens: usage.cacheReadTokens ?? 0
+```
+
+压力总量 = `inputTokens + cacheReadTokens + cacheWriteTokens`。也就是说 **`inputTokens` 必须是未缓存的部分**。
+
+WorkBuddy 的 `readUsage` 直接把 `prompt_tokens` 当 `inputTokens`，而按 OpenAI 惯例
+`prompt_tokens` **包含**缓存命中的部分。于是每一轮都把命中缓存的 token 算成新输入，缓存命中率恒为 0。
+
+这一条不能靠猜——帧转储里没有 WorkBuddy 的用量帧（那是 Qoder 子进程的 stdout，WorkBuddy 是
+HTTP SSE）。所以直接抓了一次真实响应，取到上游完整对象：
+
+```json
+{"prompt_tokens":28,"completion_tokens":21,"total_tokens":49,
+ "completion_tokens_details":{"reasoning_tokens":18,"cached_tokens":0},
+ "prompt_tokens_details":{"cached_tokens":0},
+ "prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":28,
+ "cache_read_input_tokens":0,"cache_creation_input_tokens":0,
+ "prompt_cache_write_tokens":0,"cached_tokens":0,"credit":0.01}
+```
+
+同一个事实它用四种写法报了三遍。修法是四种都读，按最具体的优先，然后从 `prompt_tokens` 里减掉：
+
+```js
+const cached = pick(usage.prompt_tokens_details?.cached_tokens)
+  ?? pick(usage.cached_tokens)
+  ?? pick(usage.prompt_cache_hit_tokens)
+  ?? pick(usage.cache_read_input_tokens);
+```
+
+缓存写入同理（`prompt_cache_write_tokens` / `cache_creation_input_tokens`）。
+
+两个防御性细节：**总量不变**（缓存的 token 仍然只计一次，只是换了个桶），所以这条缺陷永远
+不会以失败的形式出现；**缓存数大于 prompt 数时整体丢弃**而不是减成负数——宿主的 schema 是
+非负整数，负数会让整个 usage chunk 被拒，那比少报缓存严重得多。
+
+顺带确认了 `reasoningTokens` 的语义：它是 `outputTokens` 的附属显示（`completion_tokens`
+包含 `reasoning_tokens`），不参与求和，所以没有重复计算。
+
+### 验证
+
+`test/workbuddy-usage.mjs`（8 条）：缓存命中进独立桶、总量不重复计、缓存写入、两种别名、
+无缓存字段时照常、无用量帧时照常、不可能的缓存值被忽略。
+
+反向验证：把 `usable` 恒定为 `undefined` → 3 条红。真机 WorkBuddy 6/6 绿。
+
+### 方法记录：这次没有再靠「读代码猜」
+
+上一轮那条 `UNKNOWN` 是**看真机输出**发现的。这一条是**主动去问上游要原始对象**发现的。
+两次都不是靠再读一遍代码。这条线索本来可以靠猜得出结论（"OpenAI 惯例 prompt_tokens 含缓存"），
+但如果猜错，改动照样"看起来对"，测试也照样绿——因为它根本没测过真实字段。
+
+所以这次的顺序是：先抓一次真实响应拿到原文，再按原文写用例，最后才改代码。抓取脚本用完即删
+（`test/` 下不留一次性探针，避免下次有人把它当正式测试跑）。
 
