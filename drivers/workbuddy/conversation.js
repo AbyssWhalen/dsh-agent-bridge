@@ -172,18 +172,18 @@ export class WorkBuddyConversation {
      */
     const delivered = () => sawToolCall || sawText || sawReasoning;
 
-    // An idle *timeout*, not an interval: a long answer that keeps producing
-    // frames must never be killed by the clock. The old version fired once from
-    // stream start regardless of traffic, so a slow but healthy turn died at the
-    // mark with "produced nothing", which was a lie.
-    const timer = setInterval(() => {
-      if (queue.closed) return;
-      if (Date.now() < deadline) return;
-      stalled = true;
-      queue.fail(new Error(`workbuddy: the stream produced nothing for ${STREAM_IDLE_TIMEOUT_MS}ms`));
-    }, Math.min(STREAM_IDLE_TIMEOUT_MS, 5_000));
-    timer.unref?.();
-
+    /**
+     * Close every call that was announced but not finished.
+     *
+     * Idempotent, and it has to be called on every way out of the turn, not only the tidy
+     * ones. Every `block-start` the driver pushes has already been recorded by the host, so a
+     * `block-start` with no matching `block-end` is a broken history entry — the shape that
+     * produced `11148 tool calls and tool results do not match` in a live capture. A call cut
+     * off mid-arguments is still worth closing: the harness pairs it, the tool rejects the
+     * partial arguments, and the failure is legible.
+     *
+     * Defined before the idle timer because the timer is one of the ways out.
+     */
     const closeCalls = () => {
       for (const call of openCalls.values()) {
         queue.push({
@@ -194,6 +194,19 @@ export class WorkBuddyConversation {
       }
       openCalls.clear();
     };
+
+    // An idle *timeout*, not an interval: a long answer that keeps producing
+    // frames must never be killed by the clock. The old version fired once from
+    // stream start regardless of traffic, so a slow but healthy turn died at the
+    // mark with "produced nothing", which was a lie.
+    const timer = setInterval(() => {
+      if (queue.closed) return;
+      if (Date.now() < deadline) return;
+      stalled = true;
+      closeCalls();
+      queue.fail(new Error(`workbuddy: the stream produced nothing for ${STREAM_IDLE_TIMEOUT_MS}ms`));
+    }, Math.min(STREAM_IDLE_TIMEOUT_MS, 5_000));
+    timer.unref?.();
 
     // Text is held back by a marker's length so a call that arrives as text can
     // still be recognized. Only the tail is at risk: a full marker is detected on
@@ -470,6 +483,12 @@ export class WorkBuddyConversation {
           // same way the request path reports it, so one cancellation always looks
           // like one thing.
           const cancellation = signal?.aborted === true;
+          // A call announced a moment before the stream died is still open. Closing it here
+          // keeps the chunk stream pairable: the host has already recorded the `block-start`,
+          // and a call left unpaired is what produced `tool calls and tool results do not
+          // match` in a live capture. The partial arguments are the tool's problem, not the
+          // history's.
+          closeCalls();
           queue.fail(
             cancellation
               ? new UpstreamFailure('cancelled', 0, 'the caller cancelled the request')

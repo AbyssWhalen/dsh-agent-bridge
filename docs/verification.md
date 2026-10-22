@@ -636,7 +636,7 @@ if (lowered.startsWith(stem) && lowered.length - stem.length <= SLACK) return tr
 
 - 离线：`npm run check` 退出码 0；`dsml dialects` 36、`dsml delta split` 13、`workbuddy dialect` 4、`qoder notices` 5。
 - 真机：`capturewb4` 14/14 绿（帧转储 45 帧、0 处标记、0 处参数键异常）。
-- 续：`test/workbuddy-dialect.mjs` 7 条、`test/empty-turn.mjs` 6 条进链；空轮在两个驱动上都已改为失败。
+- 续：`test/workbuddy-dialect.mjs` 7 条、`test/empty-turn.mjs` 6 条、`test/block-pairing.mjs` 3 条进链；空轮在两个驱动上都已改为失败；调用块在超时与断流两个出口上补了闭合。
 - 未验证：WorkBuddy 是否也会把额度通知当回答（`H-010`，无证据，未改代码）。
 
 ---
@@ -681,4 +681,64 @@ if (lowered.startsWith(stem) && lowered.length - stem.length <= SLACK) return tr
 - 只有工具调用的轮次必须仍然正常结束（两侧各一条）——这是编码会话最常见的形状，判空判错就会全线崩
 
 反向验证：把两侧的 `if (!delivered())` 分别改成 `if (false)`，各红一条，互不影响。这同时证明了双驱动套件的价值：只修一侧，一半的用例会红。
+
+
+---
+
+## 十七、第七轮续二：调用的块没有闭合，以及一个把失败伪装成通过的探针
+
+### 第二十二条：连接在调用中途断开，`block-start` 没有对应的 `block-end`
+
+WorkBuddy 的调用是「先开块、后闭块」：第一次看到某个 index 的 delta 就 push `block-start`，
+后续 delta 往里填参数，收尾时 `closeCalls()` 统一 push `block-end`。出口有四个，修前只有两个
+调了 `closeCalls()`：
+
+| 出口 | 修前 | 修后 |
+| --- | --- | --- |
+| 正常 `[DONE]` | 调了 | 调了 |
+| 上游 error 帧 | 调了 | 调了 |
+| 空闲超时 | **没调** | 调了 |
+| 流抛异常（socket 断开） | **没调** | 调了 |
+
+后果就是 F-003 的成因：`block-start` 已经在宿主侧记下了，`block-end` 没来，历史里留下一个
+没有结果的调用——真机上表现成 `11148 tool calls and tool results do not match`。
+
+两处都要修，而且顺序有讲究：`closeCalls()` 是幂等的（push 完 `clear()`），但必须在 `queue.fail()`
+**之前**调用，因为 `fail` 之后队列已关闭，后续 `push` 全部被丢弃：
+
+```js
+closeCalls();
+queue.fail(...);
+```
+
+`timer` 回调里也有同样的问题，而且它比 catch 更早能拿到引用——`closeCalls` 原来定义在 `timer`
+之后，直接调用会踩 TDZ。把 `closeCalls` 的定义移到 `timer` 之前。
+
+Qoder 侧没有这个问题：`emitCall` 一次性把 `block-start`、两条 `tool-call-delta`、`block-end`
+同步推完，调用从不处于「已开未闭」状态。测试里保留了一条用例断言这个**性质**，不是为了修
+什么——它一旦变红，说明 Qoder 的调用改成流式拼接了。
+
+### 同一次排查里的方法失误：探针在错的目录里「全绿」
+
+第一次验证这一条时，探针写在 `_probe/`，里面用 `new URL('./fake-delta-runtime.mjs', import.meta.url)`
+解析假 runtime。`_probe/` 下没有那个文件，Qoder 启动直接失败、报错——而我的断言是
+`assert.notEqual(failure, undefined)`，**「启动失败」和「调用未闭合」都满足它**。于是 Qoder
+那条用例一直显示 OK，而它其实什么都没验证到。
+
+发现的方式不是再看一遍代码，是同一个脚本复制到 `test/` 之后结果变了。同一个文件、只改了
+一个用例名，两次结果不同——这不是随机性，是路径。修法是让所有 runtime 路径都相对文件自身
+解析，并在文件头部写明理由：这个套件也会从已安装的 profile 里跑，裸 `./` 在那里指向空气。
+
+教训和前面几条不一样：前面是「测试不会红就说明没测到」，这一条是**「测试会绿也可能什么都没测到」**。
+绿比红更危险，因为没人会去看。
+
+### 验证
+
+`test/block-pairing.mjs`（3 条）：
+
+- WorkBuddy 调用被断流切断后仍然闭合
+- WorkBuddy 正常完成的调用恰好闭合一次（防重复闭合）
+- Qoder 恢复出的调用是一个整体（性质断言）
+
+反向验证：删掉 catch 分支的 `closeCalls()` → 第一条红。
 
