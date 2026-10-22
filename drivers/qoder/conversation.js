@@ -745,9 +745,18 @@ function failureDetail(message) {
 /**
  * The error a cancelled turn reports.
  *
- * Named `AbortError` on purpose: that is what the harness and every HTTP client
- * already agree means "the caller stopped this", and it is what keeps a cancelled
- * turn from being reported as, or retried like, an upstream failure.
+ * Carries both conventions, because the two drivers serve the same host and a host can only
+ * key on one of them:
+ *
+ * - `name = 'AbortError'` — what the harness and every HTTP client already agree means "the
+ *   caller stopped this", and what `test/qoder-cancel.mjs` asserts.
+ * - `kind = 'cancelled'` — the shape this repo documents for the other driver, asserted in
+ *   `test/cancellation.mjs` (`failure?.kind === 'cancelled'`).
+ *
+ * Setting only the name, which is what this used to do, meant a host keying on `kind` could
+ * not tell a Qoder cancellation from an unclassified fault while the identical WorkBuddy event
+ * read as `cancelled`. Neither shape replaces the other: `kind` is what the retry logic reads,
+ * `name` is what the error banner and the HTTP-shaped helpers read.
  *
  * @param {string} message
  * @returns {Error}
@@ -755,6 +764,7 @@ function failureDetail(message) {
 function cancellation(message) {
   const error = new Error(message);
   error.name = 'AbortError';
+  error.kind = 'cancelled';
   return error;
 }
 

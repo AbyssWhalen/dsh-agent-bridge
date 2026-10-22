@@ -636,7 +636,7 @@ if (lowered.startsWith(stem) && lowered.length - stem.length <= SLACK) return tr
 
 - 离线：`npm run check` 退出码 0；`dsml dialects` 36、`dsml delta split` 13、`workbuddy dialect` 4、`qoder notices` 5。
 - 真机：`capturewb4` 14/14 绿（帧转储 45 帧、0 处标记、0 处参数键异常）；`capturewb5` 12/12 绿（新增空轮/闭合守卫之后，确认没有误杀真实轮次）。
-- 续：`workbuddy-dialect` 7 条、`empty-turn` 6 条、`block-pairing` 3 条、`close-mid-turn` 2 条、`preflight-cancel` 3 条进链；空轮在两个驱动上都已改为失败；调用块在超时与断流两个出口上补了闭合；`close()` 现在会结束正在跑的那一轮；调用前已取消的轮次不再发出请求。
+- 续：`workbuddy-dialect` 7 条、`empty-turn` 6 条、`block-pairing` 3 条、`close-mid-turn` 2 条、`preflight-cancel` 3 条、`driver-parity` 12 条进链；空轮在两个驱动上都已改为失败；调用块在超时与断流两个出口上补了闭合；`close()` 现在会结束正在跑的那一轮；调用前已取消的轮次不再发出请求；两个驱动的取消错误统一带上 `kind` 与 `name` 两种标记。
 - 未验证：WorkBuddy 是否也会把额度通知当回答（`H-010`，无证据，未改代码）。
 
 ---
@@ -838,4 +838,53 @@ signal 从头到尾没被看过一眼。
 正常 signal 不受影响。反向验证：删掉守卫 → 前两条红。
 
 第三条（防误杀）是必须的：守卫写错会变成「所有轮次都不发」，那比原缺陷严重得多。
+
+
+---
+
+## 二十、第七轮收尾：把「去另一个驱动找同一课」变成一张表
+
+### 第二十五条：同一个取消事件，两个驱动给出互不相交的形状
+
+`test/cancellation.mjs` 里写着这个仓库自己的契约：取消要满足 `failure.kind === 'cancelled'`。
+`test/qoder-cancel.mjs` 里写的是另一条：取消要满足 `failure.name === 'AbortError'`。
+
+两份都是对的，因为它们测的是不同驱动：
+
+| 驱动 | 取消时的形状 |
+| --- | --- |
+| WorkBuddy | `UpstreamFailure { name: 'UpstreamFailure', kind: 'cancelled' }` |
+| Qoder | `Error { name: 'AbortError' }`（**没有 `kind`**） |
+
+同一个事件，宿主只能按一个键判断，所以无论按哪个键，都必然有一个驱动被误判：按 `kind`
+看，Qoder 的取消变成一个未分类故障；按 `name` 看，WorkBuddy 的取消变成上游故障。
+
+修法是让 Qoder 的错误同时带两种标记。`kind` 是重试逻辑读的，`name` 是错误横幅和 HTTP
+形状的辅助函数读的，两者互不替代：
+
+```js
+error.name = 'AbortError';
+error.kind = 'cancelled';
+```
+
+两份现有契约继续成立（`qoder-cancel.mjs` 仍然 OK），而 `driver-parity` 的 `kind` 断言
+开始通过。反向验证：删掉 `error.kind` 那一行 → Qoder 那条红、WorkBuddy 那条仍绿。
+
+### 把教训做成表：`test/driver-parity.mjs`
+
+这一轮出现了四种同源缺陷形状（只修一侧、输入表不全、两侧都缺、同一课另一个驱动没学）。
+靠「再读一遍代码」找不到它们——前二十条里有几条是读了四遍代码都没发现的。所以这里换成一
+张表：把**用户能观察到的保证**逐条列出来，然后要求两个驱动各自证明。
+
+当前 6 条保证 × 2 个驱动 = 12 个断言：
+
+1. 已取消的轮次不发出请求
+2. 空轮是失败，不是空白答案
+3. 退化轮是失败，不上屏
+4. 调用标记不进正文
+5. 每个宣告过的块都会闭合（即使流死掉）
+6. 整块到达的轮次恰好交付一次
+
+这张表的价值不在现在全绿，而在于**下次改任一驱动时，另一侧会自动被问到同一个问题**。
+新增一条保证只要在数组里加一项，两个驱动各写一个函数；漏写一个，那一半直接缺失。
 
