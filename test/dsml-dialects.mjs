@@ -278,6 +278,28 @@ check('the canonical dialect unwraps a parameter named args too', () => {
   assert.deepEqual(JSON.parse(calls[0].arguments), { command: 'Get-Location', description: 'cwd' });
 });
 
+check('a call wrapped in the <｜tool> container is recognised', () => {
+  // The container tag is a marker even though the bare word is not a tag name: without that,
+  // a block opening `<｜tool>` released itself as text before anything recognisable arrived.
+  const block = [
+    '<｜tool>',
+    '<tool_name>pwsh</tool_name>',
+    '<args><command>Get-Location</command></args>'
+  ].join('\n');
+  const { calls } = parseLeakedCalls(block);
+  assert.equal(calls.length, 1, `expected 1 call, got ${calls.length}`);
+  assert.deepEqual(JSON.parse(calls[0].arguments), { command: 'Get-Location' });
+});
+
+check('the bare word tool in prose is not markup', () => {
+  // The reason the container is matched only with a delimiter in front: `tool` is an ordinary
+  // word in writing about markup, including this plugin's own documentation.
+  for (const prose of ['Use the <tool> element here.', '<tool> is a container', 'A <tool_name> tag']) {
+    assert.equal(hasNativeLeak(prose), false, `prose was treated as a marker: ${prose}`);
+    assert.equal(stripLeak(prose), prose, `prose was rewritten: ${prose}`);
+  }
+});
+
 // The `argument` spelling, which the prompt's own example uses.
 const TOOL_CALL_ARGUMENT = [
   '<｜tool_call>',

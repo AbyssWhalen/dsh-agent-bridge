@@ -141,6 +141,19 @@ for (const split of [false, true]) {
       assert.deepEqual(JSON.parse(calls[0].arguments), { command: 'Get-ChildItem -Force' });
       assert.equal(/[\uFF5C\u2581]/u.test(text), false, `markup reached the text channel: ${JSON.stringify(text)}`);
     }
+
+    // The `<｜tool>` container carries no marker of its own in the tag-name sense — it is
+    // recognised as a marker only because the container spelling is listed. Without it the
+    // opening tag went out as prose and nothing downstream was recognised: `calls=0`.
+    const container = [
+      '<｜tool>',
+      '<tool_name>pwsh</tool_name>',
+      '<args><command>Get-ChildItem -Force</command></args>'
+    ].join('\n');
+    const viaContainer = await run([container], split);
+    assert.equal(viaContainer.calls.length, 1, `expected 1 call via the container, got ${viaContainer.calls.length}`);
+    assert.deepEqual(JSON.parse(viaContainer.calls[0].arguments), { command: 'Get-ChildItem -Force' });
+    assert.equal(/[\uFF5C\u2581]/u.test(viaContainer.text), false, `markup reached the text channel: ${JSON.stringify(viaContainer.text)}`);
   });
 
   await check(`native control tokens yield a call (${label})`, async () => {

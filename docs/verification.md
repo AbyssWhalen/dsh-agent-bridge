@@ -568,3 +568,11 @@ Node 对 unhandled rejection 的默认行为是终止进程。也就是说：子
 - 反向验证：去掉 `TAG_NAMES` 的 `call` → 逐字符流那条红；去掉 `parseMisplacedCalls` 调用 → 位移用例红；`unwrapArguments` 改回直接返回 → 两条壳用例红。
 - 离线：`dsml dialects` 34 条、`dsml delta split` 13 条，`npm run check` 退出码 0。
 - 帧转储普查（新抓的 2521 帧）：清理残留 0；「有标记无调用」5 个全是流式半截 delta，`rest` 已清空。
+
+### 第十八条：`<｜tool>` 容器标签本身不是标记，整块当正文放出去
+
+第十七条修完之后，`<｜tool>` 这个容器在普查里出现了 4 次——它不在 `TAG_NAMES` 里，所以 `hasNativeLeak` 为 false。后果不是"少识别一个标签"，而是**整块**失效：hold 从不触发，`<｜tool>` 当正文发出去；而 `tool_name` 元素自己一根竖线都不带，下游也没有任何东西能被认出来。实测无外壳时 `calls=0`、整块上屏。
+
+`<｜tool>` 在 `MARKER` 里补上，但**刻意不进 `TAG_NAMES`**：`tool` 是讨论标记语言时的普通词，本插件自己的文档就在写它，进了词表就会被清理步骤从句子里吃掉。只匹配"前面带分隔符"的容器，既有流式需要的证据，又不碰散文。
+
+反向验证：把 `CONTAINER` 从两个正则里去掉 → `dialects` 那条容器用例红、`delta split` 两条位移用例红。
