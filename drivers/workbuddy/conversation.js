@@ -27,7 +27,7 @@ import {
   stripLeak
 } from '../../lib/dsml.js';
 import { assistantProse, flattenConversation, messageText, splitSystem, toolCallsOf } from '../../lib/messages.js';
-import { UpstreamFailure } from './upstream.js';
+import { UpstreamFailure, classifyUpstreamError } from './upstream.js';
 import { emptyTurn, noticedFailure } from '../../lib/failure.js';
 
 /** How long a stream may go without a frame before it is considered stalled. */
@@ -425,7 +425,11 @@ export class WorkBuddyConversation {
     const pump = (async () => {
       try {
         if (response.body === null || response.body === undefined) {
-          throw new Error('workbuddy: the upstream response carried no body');
+          // A 2xx that carries no body at all: the upstream accepted the request and then sent
+          // nothing. That is a transport-shaped failure, not a caller mistake, and leaving it as a
+          // bare `Error` made it `UNKNOWN` downstream — a code the default retry policy ignores.
+          // The harness can recover from this one by simply asking again.
+          throw new UpstreamFailure('transport', 0, 'workbuddy: the upstream response carried no body');
         }
         const decoder = new TextDecoder();
         let buffer = '';
@@ -506,7 +510,17 @@ export class WorkBuddyConversation {
                       queue.close();
                       return;
                     }
-                    queue.fail(new Error(`workbuddy: the upstream reported an error: ${failure}`));
+                    // An error frame is prose, not a status: "the model is busy", "you've reached
+                    // your daily limit". There is no HTTP code left to classify it by, so the kind
+                    // is recognised from the text. Leaving it bare made the whole class `UNKNOWN`,
+                    // which is neither retryable nor legible in the log — and it is the frame an
+                    // exhausted account actually gets, so it was the most common failure of all.
+                    queue.fail(
+                      noticedFailure(
+                        `workbuddy: the upstream reported an error: ${failure}`,
+                        classifyUpstreamError(0, failure)
+                      )
+                    );
                     return;
                   }
                 }

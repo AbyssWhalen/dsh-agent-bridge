@@ -302,10 +302,23 @@ export async function readEnvelope(response) {
   try {
     parsed = JSON.parse(text);
   } catch {
-    throw new Error(`workbuddy upstream returned non-JSON (http ${response.status}): ${text.slice(0, 160)}`);
+    // A body that is not JSON is not necessarily this plugin's fault: gateways answer a dead
+    // backend with an HTML 502 page, and a captive portal answers with plain text. Classifying it
+    // from the status is what lets the harness retry the transient case — an unclassified error
+    // becomes `UNKNOWN`, which is not on the retry list, so a momentary 502 stayed a hard failure.
+    // The excerpt is kept because it is the only thing that names the gateway in the log.
+    throw envelopeFailure(
+      response.status,
+      text,
+      `workbuddy upstream returned non-JSON (http ${response.status}): ${text.slice(0, 160)}`
+    );
   }
   if (!isObject(parsed)) {
-    throw new Error(`workbuddy upstream returned an unexpected document (http ${response.status})`);
+    throw envelopeFailure(
+      response.status,
+      text,
+      `workbuddy upstream returned an unexpected document (http ${response.status})`
+    );
   }
   return {
     code: typeof parsed.code === 'number' ? parsed.code : 0,
@@ -315,10 +328,33 @@ export async function readEnvelope(response) {
   };
 }
 
+/**
+ * Build the error for a body that could not be read as an envelope.
+ *
+ * Marked with `bridgeKind` rather than left bare so {@link kindOf} can classify it downstream.
+ * The alternative — a plain `Error` whose only clue is the wording — reaches the harness as
+ * `UNKNOWN` and shows up in the log as `dsh: INTERNAL: …`, which reads like a bug in this plugin
+ * at exactly the moment the upstream is the thing that is broken.
+ *
+ * @param {number} status
+ * @param {string} body
+ * @param {string} message
+ * @returns {Error}
+ */
+function envelopeFailure(status, body, message) {
+  const error = new Error(message);
+  error.bridgeKind = classifyUpstreamError(status, body);
+  return error;
+}
+
 /** Fail an envelope whose business code is non-zero. */
 export function envelopeError(status, envelope) {
   const kind = classifyUpstreamError(status, envelope.msg);
-  return new Error(`workbuddy upstream ${kind} (http ${status}): ${envelope.msg.slice(0, 160)}`);
+  const error = new Error(`workbuddy upstream ${kind} (http ${status}): ${envelope.msg.slice(0, 160)}`);
+  // The kind used to survive only as a word inside the message. `kind` is what decides whether
+  // the harness retries, so it belongs in a field.
+  error.bridgeKind = kind;
+  return error;
 }
 
 /**
