@@ -184,6 +184,24 @@ await check('a second turn after the first finishes reuses the session', async (
   await adapter.close?.();
 });
 
+await check('many sequential turns on one key open exactly one session', async () => {
+  // Long-run shape. A soak of 783 turns across 5 lanes showed the pool holding steady — this is
+  // the offline statement of what that run proved: reuse is unbounded, only the first turn opens.
+  //
+  // A pool that opened per turn would pass every single-turn test and still be wrong, because the
+  // cost is invisible until the run is long enough for it to matter.
+  const driver = stubDriver({ delayMs: 1 });
+  const adapter = await makeAdapter(driver);
+
+  for (let i = 0; i < 12; i += 1) {
+    await turn(adapter, { provider: 'stub', model: 'm', sessionId: 'S', messages: userTurn(`turn-${i}`) });
+  }
+
+  assert.equal(driver.opened.length, 1, `${driver.opened.length} sessions for 12 sequential turns on one key`);
+  assert.equal(driver.opened[0].prompts.length, 12, 'the reused session did not receive every turn');
+  await adapter.close?.();
+});
+
 // ── Saturation forces a new session rather than an unserved turn ────────────
 await check('turns beyond the budget are still served', async () => {
   const driver = stubDriver({ delayMs: 40 });
