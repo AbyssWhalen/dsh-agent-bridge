@@ -124,7 +124,16 @@ export async function loadBridge() {
           }
           await new Promise((resolve) => setTimeout(resolve, 250));
         }
-        return adapters.get(provider);
+        // Returning `undefined` here used to push the failure downstream, where it surfaced as
+        // `Cannot read properties of undefined (reading 'stream')` — an internal error that says
+        // nothing about the actual cause. A probe exists to make causes legible, so name it.
+        const registered = [...adapters.keys()];
+        throw new Error(
+          `probe: provider "${provider}" did not come up within ${timeoutMs}ms` +
+            (registered.length === 0
+              ? '; no adapter is registered at all'
+              : `; registered: ${registered.join(', ')}`)
+        );
       },
       /**
        * The provider's live surface.
