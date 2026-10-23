@@ -167,6 +167,58 @@ await check('discard closes the handle', async () => {
   assert.equal(pool.size, 0);
 });
 
+// ── 3b. A key may be occupied twice (F-045) ─────────────────────────────────
+//
+// `#claim` finds a key absent and *then* awaits `openSession`, so two turns arriving together both
+// see `absent`, both open a session, and both call `put` with the same key. Before the fix the
+// later `set` silently replaced the earlier entry: the displaced handle left the map while still
+// holding a live upstream, nothing could close it, and `close()` never saw it again.
+//
+// This was a real leak, not a hypothetical. On Qoder, where the handle owns a worker child:
+//
+//     BEFORE CLOSE: [ 24988, 7220, 23100 ]
+//     AFTER CLOSE:  [ {pid:24988, sig:'SIGTERM'}, {pid:7220, sig:null} ]
+//     AT +3s:       [ {pid:7220, sig:null} ]
+//
+// pid 7220 never received a signal and outlived `close()`. A single-turn run was clean, which is
+// why only the concurrent case showed it.
+await check('putting a second handle on an occupied key closes the first', async () => {
+  const pool = poolOf(4);
+  const first = handle('first');
+  const second = handle('second');
+  pool.put('k', first);
+  pool.put('k', second);
+  await settle();
+
+  assert.equal(first.closed, true, 'the displaced handle was dropped without being closed');
+  assert.equal(second.closed, false, 'the newly registered handle was closed instead');
+  assert.equal(pool.size, 1);
+});
+
+await check('the displaced handle is not left for close() to find', async () => {
+  // Stated as the leak: every handle that enters the pool must leave it through a close, either
+  // here or at `close()`. Counting closes is what catches an orphan that no longer has an owner.
+  const pool = poolOf(4);
+  pool.put('k', handle('first'));
+  pool.put('k', handle('second'));
+  await settle();
+  await pool.close();
+  await settle();
+
+  assert.deepEqual([...pool.closedNames].sort(), ['first', 'second'], 'a handle entered the pool and never left it closed');
+});
+
+await check('re-registering the same handle does not close it', async () => {
+  // The fix must not punish an idempotent caller: closing the occupant unconditionally would shut
+  // down the very session that was just registered.
+  const pool = poolOf(4);
+  const only = handle('only');
+  pool.put('k', only);
+  pool.put('k', only);
+  await settle();
+  assert.equal(only.closed, false, 'a handle re-registered under the same key was closed');
+});
+
 await check('release with keep=false closes the handle', async () => {
   const pool = poolOf(4);
   const h = handle('a');

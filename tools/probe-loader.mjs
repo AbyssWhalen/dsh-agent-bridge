@@ -57,11 +57,42 @@ export async function loadBridge() {
       void body;
     },
     llm: {
+      /**
+       * The host returns a *callable handle with a `replace` method*, not a bare function.
+       *
+       * Measured against `dsh-llm`'s `registerAdapter`:
+       *
+       *     const handle = () => void dispose();
+       *     handle.replace = (next) => { ... };
+       *     return handle;
+       *
+       * A stub that returns only a function makes every `release.replace([provider])` throw, and
+       * `mount` swallows that into a debug log — so the entire route-refresh path (the one that
+       * publishes the account balance into the group name) silently did nothing under this probe.
+       * Found by turning the logger on: `could not refresh the route: TypeError:
+       * release.replace is not a function`.
+       */
       registerAdapter(providers, adapter) {
-        for (const provider of providers) adapters.set(provider, adapter);
-        return () => {
-          for (const provider of providers) adapters.delete(provider);
+        const register = (list) => {
+          for (const provider of list) adapters.set(provider, adapter);
         };
+        const unregister = (list) => {
+          for (const provider of list) adapters.delete(provider);
+        };
+        register(providers);
+        let released = false;
+        const handle = () => {
+          released = true;
+          unregister(providers);
+        };
+        handle.replace = (next) => {
+          // The host throws when a disposed registration is asked to replace its routes; a probe
+          // that quietly accepted it would hide exactly the bug it is meant to surface.
+          if (released) throw new Error('a disposed adapter registration cannot replace its routes');
+          unregister([...adapters.keys()].filter((key) => adapters.get(key) === adapter));
+          register(next);
+        };
+        return handle;
       }
     }
   };

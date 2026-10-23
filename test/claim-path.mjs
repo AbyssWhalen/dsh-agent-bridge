@@ -108,6 +108,41 @@ await check('two concurrent turns on one session id get different sessions', asy
   await adapter.close?.();
 });
 
+await check('two turns on one fresh key never share a pool entry (F-045)', async () => {
+  // The race `#claim` has to close: `take` reports `absent` until a handle exists, so two turns
+  // arriving together both open a session and both want to register under the same key. The second
+  // registration overwrites the first, and the overwritten handle keeps a live upstream with
+  // nothing left to close it.
+  //
+  // Measured on Qoder before the fix — a worker child outlived `close()` with no signal sent:
+  //     BEFORE CLOSE: [ 24988, 7220, 23100 ]
+  //     AFTER CLOSE:  [ {pid:24988, sig:'SIGTERM'}, {pid:7220, sig:null} ]
+  //     AT +3s:       [ {pid:7220, sig:null} ]
+  //
+  // This test states the invariant, not the symptom: for one fresh key, the driver must open
+  // exactly **one** session under that key. Any second open under the same key is a session the
+  // pool cannot hold a reference to, whatever happens to it afterwards. Counting closes instead
+  // would stay green as long as *some* layer cleans up, which is why the earlier form of this
+  // check could not see the race at all.
+  const driver = stubDriver();
+  const adapter = await makeAdapter(driver);
+  await Promise.all([
+    turn(adapter, { provider: 'stub', model: 'm', sessionId: 'S', messages: userTurn('one') }),
+    turn(adapter, { provider: 'stub', model: 'm', sessionId: 'S', messages: userTurn('two') })
+  ]);
+  await adapter.close();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const plain = driver.opened.filter((session) => session.key === 'S');
+  assert.equal(
+    plain.length,
+    1,
+    `one fresh key opened ${plain.length} sessions (${plain.map((s) => s.id).join(', ')}); the extra has no owner in the pool`
+  );
+  const leaked = driver.opened.filter((session) => !session.closed);
+  assert.deepEqual(leaked.map((s) => s.id), [], 'a session the driver opened was never closed');
+});
+
 await check('the second turn does not land in the first turn\'s session', async () => {
   const driver = stubDriver();
   const adapter = await makeAdapter(driver);
