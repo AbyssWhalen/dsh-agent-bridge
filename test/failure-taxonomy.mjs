@@ -190,6 +190,24 @@ await check('the harness would actually retry that code', async () => {
   assert.equal(isRetryableCode(codeFor(undefined)), false);
 });
 
+await check('the retryable set matches the harness default, name for name', async () => {
+  // `dsh-llm-retry` matches against `retryableCodes`, which defaults to this list
+  // (`@deepseek-ai/dsh-llm` → `DEFAULT_RETRYABLE_CODES`). The plugin's copy is a claim about the
+  // harness, so it is written out here rather than read from the install: this test should fail if
+  // either side changes, which is the point — a code the harness stopped retrying would otherwise
+  // keep being produced and silently never retried again.
+  const HARNESS_DEFAULT = ['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT'];
+
+  const plugin = HARNESS_DEFAULT.filter((code) => isRetryableCode(code));
+  assert.deepEqual(plugin, HARNESS_DEFAULT, 'the plugin treats a harness-retryable code as permanent');
+
+  // And nothing outside that list may be retryable, or the plugin reports a retry that cannot happen.
+  for (const code of Object.values(KIND_TO_CODE)) {
+    if (HARNESS_DEFAULT.includes(code)) continue;
+    assert.equal(isRetryableCode(code), false, `${code} is claimed retryable but the harness will not retry it`);
+  }
+});
+
 // ── 5. A failure that is not one of ours keeps its own words ───────────────────────
 await check('an unrecognised error is classified but not rewritten', async () => {
   const escapedError = await escaped(() => new Error('something nobody planned for'));
