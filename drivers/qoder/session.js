@@ -156,6 +156,15 @@ export class QoderSession {
   #died = false;
   #exited;
   #idleTimer;
+  /**
+   * How long this session may sit idle before reaping itself.
+   *
+   * Injectable for the same reason `catalogTtlMs` is: the reaper is five minutes of wall clock,
+   * and a path nobody can reach in a test is a path nothing checks. Production never passes this.
+   *
+   * @type {number}
+   */
+  #idleTeardownMs;
   #startedAt;
   #turn;
   /** Last catalog the runtime reported, with the instant it was read. */
@@ -190,6 +199,7 @@ export class QoderSession {
     this.model = options.model;
     this.reasoningEffort = options.reasoningEffort;
     this.#catalogTtlMs = typeof options.catalogTtlMs === 'number' ? options.catalogTtlMs : CATALOG_TTL_MS;
+    this.#idleTeardownMs = typeof options.idleTeardownMs === 'number' ? options.idleTeardownMs : IDLE_TEARDOWN_MS;
     const dump = process.env.DSH_BRIDGE_DUMP_FRAMES;
     this.#dumpPath = typeof dump === 'string' && dump.length > 0 ? dump : undefined;
     this.#start();
@@ -281,10 +291,23 @@ export class QoderSession {
     this.#payloadDir = undefined;
   }
 
-  /** Reset the idle reaper; called on every sign of life. */
+  /**
+   * Reset the idle reaper; called on every sign of life.
+   *
+   * The reap is logged because its cost is invisible otherwise. A Qoder worker child is ~655 MB
+   * resident, so the reaper is not optional — but the first turn after it fires pays a cold start
+   * instead of a reuse. Measured on `dfmodel`: 8306 ms to spawn and answer versus 1139 ms reused,
+   * a little over 7x. Without a line in the log, a user who thought for five minutes and then
+   * asked one more question would see a mysterious eight-second wait with nothing to explain it.
+   */
   #touchIdle() {
     if (this.#idleTimer !== undefined) clearTimeout(this.#idleTimer);
-    this.#idleTimer = setTimeout(() => this.close(), IDLE_TEARDOWN_MS);
+    this.#idleTimer = setTimeout(() => {
+      this.#options.logger?.debug?.(
+        `qoder: reaping an idle worker after ${Math.round(this.#idleTeardownMs / 1000)}s; the next turn will spawn a new one`
+      );
+      this.close();
+    }, this.#idleTeardownMs);
     this.#idleTimer.unref?.();
   }
 
