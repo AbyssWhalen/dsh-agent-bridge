@@ -1423,4 +1423,102 @@ reasoning 通道里一句自然的英文（"I made a malformed invoke"）就会�
 turn 在宿主看来什么都没消耗，比不上报更糟。余额另走 `/api/v2/quota/usage`，与按轮 credits 不是
 同一条通道。所以这里没有可修的东西——上游没给 token 数，插件不能凭空补。
 
+---
+
+## F-045 同一 sessionId 的并发请求会漏掉一个 worker 子进程
+
+### 症状
+
+Qoder 上同一 `sessionId` 并发两轮，`close()` 报告成功，但**一个 worker 子进程从未收到信号**：
+
+```
+BEFORE CLOSE: [ 24988, 7220, 23100 ]
+AFTER CLOSE:  [ {pid:24988, sig:'SIGTERM'}, {pid:7220, sig:null} ]
+AT +3s:       [ {pid:7220, sig:null} ]
+```
+
+单轮跑完全干净。只有并发才复现——所以之前**所有单轮测试都看不见它**。
+
+### 根因
+
+`#claim` 的时序：
+
+```js
+const taken = this.#pool.take(key);          // handle 存在之前一直报 absent
+if (taken.state === 'taken') return ...;
+const session = await this.#driver.openSession({ key });   // ← 竞态窗口在这里
+this.#pool.put(key, session);
+```
+
+两轮同时到达，**都**看到 `absent`，**各自** `openSession`，然后**都** `put` 同一个 key。
+`Pool.put` 用 `Map.set`，后一个直接盖掉前一个。被盖掉的 handle 从表里消失，而它手里还攥着
+一个活着的上游。
+
+### 第一次修法是错的
+
+先让 `put` 关掉被顶掉的 handle。看似合理，实际切断了**正在进行**的那一轮：两个请求各自
+`openSession` 拿到不同对象，第一个注册时它对应的轮次已经在从中流式读取。
+
+```
+4/4 并发运行报 qoder: conversation is closed
+```
+
+回退。竞态要在它产生的地方关掉。
+
+### 修法
+
+`#claim` 增加 `#opening` 集合，在 `await openSession` **之前**占住 key：
+
+```js
+if (taken.state === 'busy' || this.#pool.saturated || this.#opening.has(key)) {
+  // 第二个请求看到竞争，走 overflow
+}
+this.#opening.add(key);
+try {
+  const session = await this.#driver.openSession({ key, logger: this.#logger });
+  this.#pool.put(key, session);
+  return { session };
+} finally {
+  this.#opening.delete(key);
+}
+```
+
+`put` 保留「关闭被顶掉的 handle」作兜底，且只在 handle 不是同一对象时才关（否则会误关刚
+注册的会话）。修复后直接数句柄：
+
+```
+live children before close: 2 → after close: 0 → +2s: 0
+```
+
+| 修法 | 并发 4 轮 |
+| --- | --- |
+| 原始 | 4/4 泄漏 worker |
+| 只在 `put` 里关被顶掉的 | 4/4 回归报 `conversation is closed` |
+| `#opening` 预留 + `put` 兜底 | 4/4 正常，无串话，无残留 |
+
+### 测试的坑：断言换了两次才对
+
+第一版写成「所有开过的 session 最后都被关了」。把预留去掉**依然全绿**——因为 `put` 的兜底把
+它关掉了。数关闭只能证明「有人收拾」，证明不了「没产生过孤儿」。
+
+改成数**打开次数**：一个全新的 key 只能被打开一次。去掉预留立刻红，这才是直接事实。
+
+---
+
+## 顺带修掉：探针的 `registerAdapter` 桩不保真
+
+`tools/probe-loader.mjs` 的桩只返回一个函数。宿主返回的是「可调用函数 + `.replace` 方法」：
+
+```js
+const handle = () => void dispose();
+handle.replace = (next) => { /* 重新提交路由 */ };
+return handle;
+```
+
+于是每次 `release.replace([provider])` 都抛 `TypeError: release.replace is not a function`，
+被 `mount` 吞进 debug 日志。**余额刷新这条路径在探针里从未真正跑通过**——是把日志打开才看到的。
+
+桩已按宿主形状重写，包括「已 dispose 的注册不能再 replace」这个约束。
+
+
 
