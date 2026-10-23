@@ -76,7 +76,21 @@ for ($i = 1; $i -le $Runs; $i++) {
         Pop-Location
     }
 
-    $leaked = $transcript -match 'invoke|parameter name=|｜{2,}'
+    # Leak detection reads the *answer*, not the model's thinking.
+    #
+    # The old rule was `invoke|parameter name=|｜{2,}` over the whole transcript, and it produced
+    # false alarms: a reasoning channel that says "I made a malformed invoke" in plain English
+    # tripped it while the turn was perfectly fine — the tool ran and the answer was correct.
+    # Measured on `kmodel_latest`: 2/4 runs reported as leaks, one of which was this exact
+    # sentence inside `dsh: reasoning:`.
+    #
+    # A real leak is a *marker*, and every marker this plugin recovers spells one of these: the
+    # fullwidth-bar form `｜｜DSML`, the tag form `<｜｜invoke`, or a bar-run `parameter name=`.
+    # So: strip the reasoning paragraphs, then look for marker shapes only. Each paragraph is a
+    # `dsh: reasoning:` title line followed by its body, and stripping exactly those keeps an
+    # answer that arrives *after* a reasoning block in view — which is where a leak would be.
+    $answerOnly = $transcript -replace '(?m)^dsh: reasoning:[^\n]*\n(?:[^\n]+\n)*', ''
+    $leaked = $answerOnly -match '｜{2,}\s*DSML|<｜{2,}\s*invoke|parameter name=\s*[｜|]'
     $ran = $transcript -match [regex]::Escape($name)
     $file = Join-Path $OutDir ("run-{0:d2}-{1}.log" -f $i, $(if ($ran -and -not $leaked) { 'ok' } else { 'bad' }))
     # The planted name goes into the file. Without it a saved failure cannot be re-read
