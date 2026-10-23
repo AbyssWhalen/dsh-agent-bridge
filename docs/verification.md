@@ -1324,3 +1324,103 @@ queue.fail(new Error(`workbuddy: the stream produced nothing for ${STREAM_IDLE_T
 `withDeadline` 那层兜底也是必须的：没有守卫时这个断言是**挂住**而不是失败，而挂住的 CI 会被
 读成"基础设施问题"。
 
+
+
+# ══ 二十八、逐模型真机调用矩阵 ═══════════════════════════════════════════════════
+
+## 为什么要逐模型测
+
+之前的真机批量测试（`real-loop-capture.ps1`）每次只跑**一个**模型。用户问的是"这些模型能不能在
+DSH 里正常调用"，而这个问题是按模型回答的：二十个里坏一个，正是单模型冒烟测试看不见、却会让
+模型选择器看起来坏掉的那种情况。
+
+新增两个工具：
+
+- `tools/model-probe.mjs` —— 走**真实装配**（`apply()` 注册的 adapter、宿主会读的 catalog）跑一轮，
+  输出一行 JSON。
+- `tools/model-sweep.mjs` —— 枚举目录后逐个模型调用，限并发。
+
+`tools/probe-loader.mjs` 扮演最小宿主：`apply` 只从 `ctx` 取四样东西（`llm.registerAdapter`、
+`logger`、`effect`、`inject`），给这四样就够了，不必拉起整个 cordis 上下文。用真实装配而非手搓
+`DriverAdapter`，是因为这个项目已经为"手搓实例看不见"付过三次学费：F-032（适配器的 throw 路径）、
+F-035（哪些 options 能穿过宿主边界）、F-036（会话 key 怎么派生）。
+
+## 结果（2026-10-23）
+
+| 厂商 | 目录 | 通过 | 失败 |
+| --- | --- | --- | --- |
+| WorkBuddy | 20 | 19 | `glm-5.1` |
+| Qoder CN | 11 | 11 | — |
+
+`glm-5.1` 的失败与插件无关，理由如下：
+
+- 稳定 `400 模型无法处理此请求，请重试`，连续多轮、不同 prompt 都一样；
+- 与 `maxTokens` 无关（传 256 / 不传都 400）；
+- 与 `reasoningEffort` 无关（`none` / `low` / `high` 都 400）；
+- 同厂同形状的 `glm-5.2`、`glm-5.3`、`glm-5.3-flash` 全部正常；
+- Qoder 侧的 `gmodel`（GLM-5.3）正常，所以不是 GLM 系列本身的问题。
+
+结论：WorkBuddy 上游的这个模型 id 当前不可服务。插件把它如实报成 `BAD_REQUEST` 而不是
+`UNKNOWN`，这本身是 F-032 修好之后的正确行为。
+
+## 端到端补测
+
+探针证明的是 adapter 通路；宿主 GUI 走的是完整 agent loop，两者不是一回事。用 headless 再跑：
+
+| 厂商 | 模型 | 结果 |
+| --- | --- | --- |
+| WorkBuddy | `hy3` / `glm-5.3` / `kimi-k3-1` / `deepseek-v4-pro` | 各 1/1 |
+| Qoder | `auto` / `gmodel` / `mmodel` / `dmodel` / `kmodel` | 各 1/1 |
+
+`kmodel_latest`（Kimi-K3）在这轮里暴露了 F-039，见下节。
+
+## F-039 Kimi 的保留字分隔方言
+
+真机 4 次里 2 次失败，其中一次的失败形态是用户直接看到整段标记：
+
+    <｜｜DSML｜｜ calls>
+    <｜｜DSML｜｜ invoke name="pwsh">
+    <｜｜DSML｜｜ parameter name="command">Get-ChildItem -Force | Select-Object -ExpandProperty Name<|open|>argument key="description" type="string"<|sep|>List files in current directory
+
+`parseLeakedCalls` 一个调用都没 recover。开头是全角单竖线，`BARS` 本来就接受；问题在**参数**的
+分隔方式：不是 `</parameter>`，而是模型自己的保留字 `<|open|>` / `<|sep|>`，名字写成 `key=`。
+
+recover 不到时的兜底是"照原样显示"。那个兜底本身是对的（显示标记好过吞掉一轮），但它建立在
+"读不出来的标记是罕见情况"这个假设上。这个方言让假设失效——它不是罕见，是这个模型的常规写法。
+
+修法两条独立规则，都只在 `PARAMETER` 没收到这个 key 时补位：
+
+1. `SEPARATOR_CLOSED_PARAMETER` —— 第一个参数用普通开头但没有闭合标签，值到第一个 `<|open|>`
+   或结尾为止。**这条必须有**：少了它，`command` 被整个丢掉，而调用照样能解析，于是会带着缺失的
+   主参数去执行——比不解析更糟。
+2. `SEPARATED_ARGUMENT` —— `<|open|>argument key="x" type="t"<|sep|>value`，值到下一个
+   `<|open|>` 为止。
+
+`coerce` 顺带支持了 `type="number"` 这种写法（之前只认 `type="true"`）。
+
+验证：`test/dsml-reserved-tokens.mjs` 9 条，先红 5 条；反向验证把两条规则换成空循环 → 红 5 条。
+真机修前 2/4，修后 4/4 且泄漏为 0。
+
+## 顺带修掉：泄漏判据的假阳性
+
+`tools/real-loop-capture.ps1` 原来对**整段 transcript** 跑 `invoke|parameter name=|｜{2,}`。
+reasoning 通道里一句自然的英文（"I made a malformed invoke"）就会被判成泄漏，而那一轮 tool ran、
+答案也对。实测 `kmodel_latest` 有 1 次就是这种假阳性。
+
+改成先剥掉 reasoning 段落，再只认**标记形状**（`｜｜DSML`、`<｜｜invoke`、`parameter name=｜`）。
+用 5 个构造样本验证判据（真标记 / 假阳性 / reasoning 后接标记 / 干净答案），5/5 判对。
+
+**判据看错的对象，会让"没修好的东西看起来修好了"，也会让"修好了的东西看起来没修好"。** 后者
+这次真实发生了，代价是差点去追一个不存在的插件缺陷。凡是"看不到现象"的判据，先证明它看得见现象。
+
+## Qoder 的 usage 为什么是 null（不是缺陷）
+
+逐模型扫的时候发现所有 Qoder 模型的 `usage` 都是 `null`。查了真实帧：worker 上报的
+`input_tokens` / `output_tokens` / 缓存三项**全是 0**，而 `credits`（0.12158784）、`billable`、
+`context_usage_ratio`（0.00216…）有真实值。
+
+`turnUsage()` 只收正数计数，是**已有文档记录的故意选择**：把整排零原样上报，会让一趟装满上下文的
+turn 在宿主看来什么都没消耗，比不上报更糟。余额另走 `/api/v2/quota/usage`，与按轮 credits 不是
+同一条通道。所以这里没有可修的东西——上游没给 token 数，插件不能凭空补。
+
+
