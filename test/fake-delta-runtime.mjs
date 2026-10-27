@@ -22,6 +22,11 @@
  *                     same reason it matters for text: the reasoning guard used to strip a
  *                     half-arrived block, which deleted its opening and left the rest to be
  *                     emitted as if it were prose.
+ *   FAKE_QUEUE_ELAPSED  a JSON array of `queue_wait_elapsed_ms` values. When set, the worker
+ *                     sends that many `model_queue_status` frames before the turn's content,
+ *                     which is what a request parked behind the vendor's model actually does.
+ *                     The frame shape is the captured one (9741 ahead, 3 261 000 ms), so a
+ *                     test reads the same fields the live frame carries.
  */
 import { createInterface } from 'node:readline';
 import { appendFileSync, readFileSync } from 'node:fs';
@@ -63,6 +68,30 @@ createInterface({ input: process.stdin }).on('line', (line) => {
   }
 
   if (message?.type !== 'user') return;
+
+  // The queue heartbeats come first, because that is when they come in life: the request is
+  // parked before the model is reached, so no content can precede them.
+  const queueScript = process.env.FAKE_QUEUE_ELAPSED;
+  if (queueScript !== undefined) {
+    for (const elapsed of JSON.parse(queueScript)) {
+      write({
+        type: 'system',
+        subtype: 'model_queue_status',
+        status: 'queued',
+        request_id: 'req-1',
+        request_set_id: 'set-1',
+        model_key: 'dfmodel',
+        queue_type: 'p3',
+        queue_count: 9741,
+        wait_time_ms: 3261000,
+        queue_wait_elapsed_ms: elapsed,
+        queue_max_wait_ms: 3600000,
+        service_available: true,
+        uuid: 'u-1',
+        session_id: 's-1'
+      });
+    }
+  }
 
   for (const delta of script) {
     if (delta.length === 0) continue;

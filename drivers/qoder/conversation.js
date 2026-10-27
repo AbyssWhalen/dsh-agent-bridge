@@ -103,6 +103,50 @@ const SERVICE_NOTICE_TAIL_SLACK = 120;
 export const TURN_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
+ * How long a turn may sit in the vendor's model queue before it is reported as a timeout.
+ *
+ * The worker does not serve a request immediately: it parks it behind every other request on
+ * the same model and sends `model_queue_status` heartbeats while it waits. Measured on
+ * `dfmodel`: `queue_count: 9741`, `wait_time_ms: 3261000` — fifty-four minutes, with the
+ * service itself advertising `queue_max_wait_ms: 3600000` (an hour).
+ *
+ * Two separate faults came out of ignoring those frames, and this budget is the second one's
+ * fix. First, the heartbeat pushes the stall deadline forward like any other frame, so
+ * {@link TURN_IDLE_TIMEOUT_MS} can never expire: a queued turn is silent, reports nothing,
+ * and never fails. Second, an hour of that is indistinguishable from a hang, which is what
+ * the caller sees — a turn whose output is blocked with no explanation and no error.
+ *
+ * Fifteen minutes is a judgement, not a wire fact: long enough to ride out the ordinary
+ * queue, short enough that the caller gets an answer it can act on. The failure is `timeout`,
+ * which resolves to `TIMEOUT` and is retryable, so the harness's own retry covers the rest of
+ * the wait instead of this file blocking on it.
+ */
+export const QUEUE_WAIT_BUDGET_MS = 15 * 60 * 1000;
+
+/**
+ * Render one queue-status frame as the sentence a person needs to read.
+ *
+ * Silence is the thing being fixed, so this has to say three things: that nothing is wrong,
+ * where the request actually is, and how long the wait is. Numbers are formatted rather than
+ * interpolated raw — `3261000` is not a duration to anyone reading it.
+ *
+ * @param {{queueCount?: number, waitMs?: number}} state
+ * @returns {string}
+ */
+export function queueSentence(state) {
+  const parts = [];
+  if (Number.isFinite(state.queueCount) && state.queueCount > 0) {
+    parts.push(`${state.queueCount} request${state.queueCount === 1 ? '' : 's'} ahead`);
+  }
+  if (Number.isFinite(state.waitMs) && state.waitMs > 0) {
+    const minutes = Math.round(state.waitMs / 60_000);
+    parts.push(`roughly ${minutes} minute${minutes === 1 ? '' : 's'} to go`);
+  }
+  if (parts.length === 0) return 'qoder: waiting in the model queue';
+  return `qoder: queued behind the vendor's model — ${parts.join(', ')}`;
+}
+
+/**
  * Whether text is still on course to be a service notice.
  *
  * Used as a hold predicate: while it holds, nothing is emitted, because the text may still
@@ -700,6 +744,9 @@ export class QoderConversation {
      */
     let deadline = Date.now() + this.#idleTimeoutMs;
 
+    /** Whether this turn has already told the caller it is waiting in the model queue. */
+    let queuedAnnounced = false;
+
     const session = this.#session;
     // Env-gated frame tracing. The worker's frame shapes are undocumented, so
     // every field this driver reads was observed rather than assumed, and the next
@@ -711,6 +758,40 @@ export class QoderConversation {
       // whole time, so this deadline only ever expires on real silence.
       deadline = Date.now() + this.#idleTimeoutMs;
       trace?.(`qoder frame: ${JSON.stringify(message).slice(0, 1200)}`);
+      if (message?.type === 'system' && message.subtype === 'model_queue_status') {
+        // The worker parks the request in the vendor's model queue and sends this heartbeat
+        // while it waits. Ignoring it is what produced a turn that ran for six minutes with
+        // zero chunks: the heartbeat kept pushing `deadline` forward, so the stall guard could
+        // never fire, and the frame's own account of the wait was discarded.
+        const queueCount = Number(message.queue_count);
+        const waitMs = Number(message.wait_time_ms);
+        // `queue_wait_elapsed_ms` is the figure that matters for the budget: it is how long
+        // *this* turn has been waiting, which is what the caller experiences. `wait_time_ms` is
+        // the service's own estimate of the remaining wait and includes queue churn.
+        const waitedMs = Number(message.queue_wait_elapsed_ms);
+        const budgeted = Number.isFinite(waitedMs) ? waitedMs : 0;
+        if (!queuedAnnounced) {
+          // Say it once. The frame repeats every few seconds, and a notice per frame would
+          // bury the answer this turn eventually produces.
+          queuedAnnounced = true;
+          const sentence = queueSentence({ queueCount, waitMs });
+          this.#logger?.info?.(sentence);
+          // Pushed directly rather than through `emitText`: that helper feeds the
+          // service-notice probe, and this sentence is written by this file, cannot be a
+          // notice, and must not be able to terminate the turn as one.
+          textSeen = true;
+          queue.push({ type: 'text-delta', index: indexFor(0, 'text'), text: `${sentence}\n` });
+        }
+        if (budgeted >= QUEUE_WAIT_BUDGET_MS) {
+          queue.fail(
+            noticedFailure(
+              `${queueSentence({ queueCount, waitMs })}; this turn waited ${Math.round(budgeted / 60_000)} minutes and was released so it does not hang with no output — retry the turn`,
+              'timeout'
+            )
+          );
+        }
+        return;
+      }
       if (message?.type === 'stream_event') {
         const event = message.event;
         if (event?.type === 'content_block_delta') {
