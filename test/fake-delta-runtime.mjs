@@ -17,6 +17,11 @@
  *   FAKE_SPLIT        when set, the deltas are ignored and the joined script is cut into
  *                     single characters
  *   FAKE_RESULT       the `result` frame's text (default: the concatenated deltas)
+ *   FAKE_THINKING     when set, the deltas are thinking deltas instead of text deltas, so a
+ *                     test can drive the reasoning channel. The split matters there for the
+ *                     same reason it matters for text: the reasoning guard used to strip a
+ *                     half-arrived block, which deleted its opening and left the rest to be
+ *                     emitted as if it were prose.
  */
 import { createInterface } from 'node:readline';
 import { appendFileSync, readFileSync } from 'node:fs';
@@ -61,7 +66,15 @@ createInterface({ input: process.stdin }).on('line', (line) => {
 
   for (const delta of script) {
     if (delta.length === 0) continue;
-    write({ type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: delta } } });
+    const thinking = process.env.FAKE_THINKING === '1';
+    write({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: thinking ? { type: 'thinking_delta', thinking: delta } : { type: 'text_delta', text: delta }
+      }
+    });
   }
   // `stop_reason` rides `message_delta`, alongside the usage the driver already reads. A worker
   // that hit a token ceiling says `max_tokens` here, and that is the only place it says it.

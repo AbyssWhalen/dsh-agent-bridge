@@ -30,6 +30,7 @@ import {
   endsWithMarkerPrefix,
   hasLeak,
   hasNativeLeak,
+  hasUnclosedCallMarkup,
   isDegenerate,
   MARKER_MAX,
   parseLeakedCalls,
@@ -446,6 +447,9 @@ export class QoderConversation {
     let holding = false;
     /** Reasoning gets the same marker guard; nothing is recovered from it. */
     let pendingReasoning = '';
+    /** A reasoning block that has opened and not yet closed; see {@link acceptReasoning}. */
+    let heldReasoning = '';
+    let holdingReasoning = false;
     /**
      * What an unrecoverable call block threw away, if anything.
      *
@@ -615,13 +619,37 @@ export class QoderConversation {
     /** Stream reasoning, keeping call markup out of a channel the user reads. */
     const acceptReasoning = (delta, workerIndex) => {
       pendingReasoning += delta;
-      if (hasLeak(pendingReasoning)) {
-        const cleaned = stripLeak(pendingReasoning);
+      // While a block is open, nothing is stripped or released: the whole block is held
+      // until it closes. Stripping a half-arrived block is what leaked — see below.
+      if (holdingReasoning) {
+        heldReasoning += pendingReasoning;
         pendingReasoning = '';
+        if (hasUnclosedCallMarkup(heldReasoning) || endsWithMarkerPrefix(heldReasoning)) return;
+        const cleaned = stripLeak(heldReasoning);
+        heldReasoning = '';
+        holdingReasoning = false;
         if (cleaned.length > 0) {
           reasoningSeen = true;
           queue.push({ type: 'reasoning-delta', index: indexFor(workerIndex, 'reasoning'), text: cleaned });
         }
+        return;
+      }
+      if (hasLeak(pendingReasoning)) {
+        // Hold rather than strip.
+        //
+        // This used to run `stripLeak` on `pendingReasoning` and clear it, then carry on.
+        // With the whole block in one delta that is correct. Streamed, it is not: the first
+        // delta that trips `hasLeak` usually carries only the opening of the block, so the
+        // strip deletes the opening and the *rest* of the block arrives afterwards carrying
+        // no recognisable open tag — `hasLeak` is false for it, so it is released as
+        // ordinary reasoning and the user reads
+        // `｜｜invoke name="pwsh">｜｜parameter name="command">Get-Date` in the thinking
+        // pane. Measured through the real conversation object, char by char: five of nine
+        // shapes leaked. The text channel never had this bug because it holds on
+        // `hasNativeLeak` and settles with a parser; reasoning had neither.
+        holdingReasoning = true;
+        heldReasoning = pendingReasoning;
+        pendingReasoning = '';
         return;
       }
       const keep = endsWithMarkerPrefix(pendingReasoning) ? MARKER_MAX : 0;
@@ -634,6 +662,25 @@ export class QoderConversation {
         text: pendingReasoning.slice(0, release)
       });
       pendingReasoning = pendingReasoning.slice(release);
+    };
+
+    /**
+     * Release a held reasoning block when the turn ends mid-block.
+     *
+     * A block that never closes — the model stopped, or the turn was cut off — would
+     * otherwise be dropped entirely, which loses thinking the user can still read. The
+     * markup is stripped here the same way the batch path strips it.
+     */
+    const settleReasoning = (workerIndex = 0) => {
+      if (!holdingReasoning) return;
+      const raw = heldReasoning + pendingReasoning;
+      heldReasoning = '';
+      pendingReasoning = '';
+      holdingReasoning = false;
+      const cleaned = stripLeak(raw);
+      if (cleaned.length === 0) return;
+      reasoningSeen = true;
+      queue.push({ type: 'reasoning-delta', index: indexFor(workerIndex, 'reasoning'), text: cleaned });
     };
 
     /** Whether the turn has already shown the caller something. */
@@ -727,6 +774,11 @@ export class QoderConversation {
         // Anything still held is genuine content that never diverged from a marker
         // or a notice, so it is released before the turn closes.
         settleText();
+        // A reasoning block the model never closed is released here too. Without this the
+        // hold would swallow the tail of every turn that ends mid-block — the block is
+        // dropped rather than shown, which is the opposite failure from the leak the hold
+        // was added for.
+        settleReasoning();
         if (!released) {
           const notice = serviceNotice(noticeProbe);
           if (notice !== undefined) {
