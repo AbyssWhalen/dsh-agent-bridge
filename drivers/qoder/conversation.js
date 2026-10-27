@@ -176,6 +176,13 @@ export function toolPreamble(tools) {
     '</｜｜DSML｜｜ invoke>',
     '</｜｜DSML｜｜ calls>',
     '',
+    '`TOOL_NAME`, `PARAMETER_NAME` and `VALUE` are placeholders: replace them. A reply that',
+    'still contains the words `TOOL_NAME` or `PARAMETER_NAME` calls nothing.',
+    '',
+    'The markup is a wire format, not an answer. Never explain it, never describe it, never',
+    'quote it back, and never show it to the reader unless you are actually calling a tool.',
+    'When no tool is needed, answer in ordinary prose and use no markup at all.',
+    '',
     'Use these names exactly. Never invent a tool name, and never guess at a',
     'parameter name. After emitting a call, stop: the result arrives as the next',
     'turn. If no tool is needed, answer in plain prose as usual.',
@@ -559,14 +566,29 @@ export class QoderConversation {
           queue.fail(new Error('qoder: the model degenerated into a repetition loop and produced no answer; retry the turn'));
           return;
         }
-        // A block that was call syntax but could not be read is shown **as written**.
-        // The intent here was always "showing the markup it was written in beats swallowing
-        // a turn", but the text emitted used to be `recovered.rest` — the block with its
-        // tags stripped out. That leaves the argument values behind as ordinary prose,
-        // which reads as the model babbling and hides the only clue that anything went
-        // wrong. The raw block at least says what it was trying to do.
+        // A block that was call syntax but could not be read.
+        //
+        // This used to emit `raw` — the block exactly as written, delimiter bars and all.
+        // That is what put `<｜｜DSML｜｜ calls>` in front of the user: recovery failing is
+        // not rare enough to be an edge case, and the raw block is precisely the text the
+        // plugin told the model to write, so showing it reads as the plugin talking to
+        // itself. The prose around the block is kept instead, which is what the user can
+        // actually read; if the block was nothing but an abandoned opener, no text is
+        // emitted at all and the turn reads as empty — a state the host already knows how
+        // to retry.
+        //
+        // A block with no `invoke` in it may still be prose *about* the syntax — a sentence
+        // explaining tags — where the words are the answer and are shown as written. The
+        // test is where the markup sits, not whether it mentions `invoke`: a reply that
+        // opens with a tag is trying to call something and lost its way, while one that
+        // mentions a tag halfway through a sentence is talking about it.
+        const attempted = /invoke\s+name\s*=/iu.test(raw) || /^[\s\uFF5C|]*</u.test(raw);
         this.#logger?.warn?.('qoder: the model wrote call syntax as text and it could not be recovered');
-        emitText(raw, 0);
+        if (!attempted) {
+          emitText(raw, 0);
+          return;
+        }
+        if (recovered.rest.length > 0) emitText(recovered.rest, 0);
         return;
       }
       for (const call of recovered.calls) emitCall(call);

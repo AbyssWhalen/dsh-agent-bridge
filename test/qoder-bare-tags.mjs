@@ -126,3 +126,30 @@ test('html-looking prose is not swallowed as a call', async () => {
   assert.equal(calls.length, 0);
   assert.match(text, /backticks/, `the text must survive; got ${JSON.stringify(text)}`);
 });
+
+test('an unrecoverable attempt never reaches the user as markup', async () => {
+  // An opener with no parameters: the turn was cut off before it asked for anything, so
+  // there is no call to invent. What must not happen is the block being printed — that is
+  // the shape the user reported as "a big chunk of noise", and this is the branch that
+  // produced it. The prose in front of it is still the model's answer and is kept.
+  const { text, calls } = await turn(['Let me look at that. <invoke name="pwsh">']);
+  assert.equal(calls.length, 0, 'nothing was actually asked for');
+  assert.equal(/invoke|parameter|</u.test(text), false, `markup reached the user: ${JSON.stringify(text)}`);
+  assert.match(text, /Let me look at that/, 'and the sentence before it survives');
+});
+
+test('a reply opening with a stray tag shows no markup', async () => {
+  // Same shape without leading prose: nothing usable remains, so the turn reads as empty.
+  // That is a state the host already retries; printing the tag is not.
+  const { text, calls } = await turn(['<parameter name="command">Get-Date']);
+  assert.equal(calls.length, 0);
+  assert.equal(/parameter|</u.test(text), false, `markup reached the user: ${JSON.stringify(text)}`);
+});
+
+test('prose that merely mentions a tag keeps its words', async () => {
+  // Mid-sentence markup is explanation, not a call attempt. Stripping it would garble the
+  // one case where the text itself is the answer.
+  const { text, calls } = await turn(['The parser accepts <parameter name="x"> as an argument.']);
+  assert.equal(calls.length, 0);
+  assert.match(text, /accepts/, `the sentence must survive; got ${JSON.stringify(text)}`);
+});
