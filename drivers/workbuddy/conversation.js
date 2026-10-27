@@ -25,6 +25,7 @@ import {
   isDegenerate,
   MARKER_MAX,
   parseLeakedCalls,
+  scrubForReplay,
   stripLeak,
   truncateOpenMarkup
 } from '../../lib/dsml.js';
@@ -681,7 +682,7 @@ export function toWireMessages(messages, region) {
     // spelling, producing a burst of pseudo-call text beside the real call.
     const text =
       message.role === 'assistant'
-        ? stripLeak(calls.length > 0 ? assistantProse(message) : messageText(message))
+        ? scrubForReplay(calls.length > 0 ? assistantProse(message) : messageText(message))
         : messageText(message);
     if (message.role === 'tool') {
       if (text.length === 0) continue;

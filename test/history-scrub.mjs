@@ -19,14 +19,22 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { appendPrompt, flattenConversation, flattenTranscript } from '../lib/messages.js';
+import { hasLeak } from '../lib/dsml.js';
 
 const B = '\uFF5C';
 const user = (text) => ({ role: 'user', content: [{ type: 'text', text }] });
 const assistant = (text) => ({ role: 'assistant', content: [{ type: 'text', text }] });
 const result = (id, text) => ({ role: 'tool', toolCallId: id, content: [{ type: 'text', text }] });
 
-/** Anything that came from the wire format rather than from the model's own words. */
-const MARKUP = /[｜|]{2}|DSML|<invoke|<parameter|\[tool call/iu;
+/**
+ * Whether the wire format reached the output.
+ *
+ * This is the module's own recogniser rather than a hand-written regex, because the hand-written
+ * one silently dropped the conclusion: it listed `invoke` and `parameter` but not `tool_call` or
+ * `antml`, so three of the shapes below were never actually checked, and a counterfactual that
+ * removed the fix still came back green. A test's judgement is as fallible as the code it tests.
+ */
+const MARKUP = hasLeak;
 
 /** The shapes a pre-fix session can have stored. */
 const LEAKS = {
@@ -34,7 +42,14 @@ const LEAKS = {
   'bare tags': '<invoke name="pwsh"><parameter name="command">dir</parameter></invoke>',
   'single bar': `<${B}DSML${B}invoke name="pwsh">Get-Date</${B}DSML${B}invoke>`,
   'antml tags': '<antml:invoke name="pwsh"><antml:parameter name="command">dir</antml:parameter></antml:invoke>',
-  'the plugin\'s own bracket form': '[tool call: pwsh {"command":"dir"}]'
+  'the plugin\'s own bracket form': '[tool call: pwsh {"command":"dir"}]',
+  // A turn cut off mid-write stores a tag that never reached its `>`. That is the shape the
+  // first version of this scrub missed: `stripLeak` leaves an unterminated marker alone on
+  // purpose, so replaying needs the truncation step too. Found by a counterfactual that
+  // removed it and watched this file stay green — the case simply was not here.
+  'a native block cut mid-write': `<${B}${B}DSML${B}${B}invoke name="pwsh"><${B}${B}DSML${B}${B}parameter name="command">Get-D`,
+  'a bare tag cut mid-write': '< tool_call name="pwsh">< parameter name="command">Get-D',
+  'a tag with no attributes yet': 'thinking <tool_call'
 };
 
 test('a stored leak is not replayed by any of the three flatteners', () => {
@@ -47,7 +62,7 @@ test('a stored leak is not replayed by any of the three flatteners', () => {
       ['appendPrompt', (m) => appendPrompt(m, 'and again')]
     ]) {
       const out = render(history);
-      if (MARKUP.test(out)) failures.push(`${name} / ${label} -> ${JSON.stringify(out.slice(0, 140))}`);
+      if (MARKUP(out)) failures.push(`${name} / ${label} -> ${JSON.stringify(out.slice(0, 140))}`);
     }
   }
   assert.deepEqual(failures, [], `history still teaches the markup:\n${failures.join('\n')}`);
@@ -120,7 +135,7 @@ test('every path that renders history to a model scrubs it', async () => {
   };
 
   const failures = Object.entries(rendered)
-    .filter(([, out]) => MARKUP.test(out))
+    .filter(([, out]) => MARKUP(out))
     .map(([name, out]) => `${name} -> ${JSON.stringify(out.slice(0, 120))}`);
   assert.deepEqual(failures, [], `a replay path still teaches the markup:\n${failures.join('\n')}`);
   assert.equal(Object.keys(rendered).length, 4, 'the audit covers every rendering path');
