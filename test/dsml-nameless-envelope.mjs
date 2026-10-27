@@ -104,3 +104,86 @@ test('an unterminated nameless envelope does not eat the turn', () => {
   // And whatever it does with the fragment, it must not claim a call.
   assert.equal(parseLeakedCalls(cut).calls.length, 0);
 });
+
+/**
+ * The second report, from the same vendor.
+ *
+ * This one ends with `</invoke>` and never has an `<invoke name="…">` opener — and the
+ * first version of this rule tested for the *word* `invoke`, so that trailing closer
+ * satisfied the guard and the block was skipped whole. The lesson is in the fixture: a
+ * closing tag is not evidence that a call was ever named.
+ *
+ * It also spells the closer with the full lettered delimiter, `</｜｜DSML｜｜ calls>`, where
+ * the first report used a bare `</｜｜ calls>`. A close pattern that accepted only one of
+ * the two would have looked fixed against whichever sample it was written from.
+ */
+const WITH_TRAILING_CLOSER = [
+  `<${B}｜DSML｜${B} calls> <${B}｜DSML｜${B} parameter name="command" string="true">`,
+  "$w=' D:\\DshWork\\CyberWork ';",
+  "$TRACKED30ASSETS=' +((git -C $w ls-files '30_assets' | Measure-Object).Count);",
+  "'GIT_STATUS_ROOT:'; git -C $w status --porcelain --untracked-files=normal 2>&1",
+  `</${B}｜DSML｜${B} parameter>`,
+  `<${B}｜DSML｜${B} parameter name="description" string="true">Check git tracking</${B}｜DSML｜${B} parameter>`,
+  `</${B}｜DSML｜${B} invoke> </${B}｜DSML｜${B} calls>`
+].join('\n');
+
+test('a trailing </invoke> does not make an unnamed block recoverable', () => {
+  const { calls, rest } = parseLeakedCalls(WITH_TRAILING_CLOSER);
+  assert.equal(calls.length, 0, 'no opener named a tool, so no call may be invented');
+  assert.equal(rest.trim(), '', `the body must not survive; got ${JSON.stringify(rest.slice(0, 120))}`);
+});
+
+test('the replay path drops it too', () => {
+  assert.equal(stripLeak(WITH_TRAILING_CLOSER).trim(), '');
+});
+
+test('both closer spellings are recognised', () => {
+  // Bare closer (first report) and lettered closer (second report) must both terminate
+  // the block. A pattern written against one sample silently ignores the other.
+  for (const closer of [`</${B}${B} calls>`, `</${B}｜DSML｜${B} calls>`]) {
+    const block = [
+      `<${B}｜DSML｜${B} calls>`,
+      `<${B}｜DSML｜${B} parameter name="command">payload</${B}｜DSML｜${B} parameter>`,
+      closer
+    ].join('\n');
+    assert.equal(
+      parseLeakedCalls(block).rest.trim(),
+      '',
+      `closer ${JSON.stringify(closer)} must terminate the block`
+    );
+  }
+});
+
+test('a string="true" attribute neither blocks recovery nor leaks into the arguments', () => {
+  // The second report spells both parameters `name="…" string="true"`. That is an
+  // attribute the tool schema never declares, so it must not arrive as an argument.
+  const good = [
+    `<${B}｜DSML｜${B} calls>`,
+    `<${B}｜DSML｜${B} invoke name="pwsh">`,
+    `<${B}｜DSML｜${B} parameter name="command" string="true">ls</${B}｜DSML｜${B} parameter>`,
+    `<${B}｜DSML｜${B} parameter name="description" string="true">List</${B}｜DSML｜${B} parameter>`,
+    `</${B}｜DSML｜${B} invoke>`,
+    `</${B}｜DSML｜${B} calls>`
+  ].join('\n');
+  const { calls, rest } = parseLeakedCalls(good);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].name, 'pwsh');
+  assert.deepEqual(JSON.parse(calls[0].arguments), { command: 'ls', description: 'List' });
+  assert.equal(rest.trim(), '');
+});
+
+test('a named invoke still wins over the nameless rule when both are present', () => {
+  // Two envelopes in one turn, the second one degenerate. The first must still be
+  // recovered — this is also the case a stateful `g` regex would answer wrongly,
+  // because `lastIndex` from the first match would decide the second.
+  const two = [
+    `<${B}｜DSML｜${B} calls><${B}｜DSML｜${B} invoke name="read_file"><${B}｜DSML｜${B} parameter name="path">a.txt</${B}｜DSML｜${B} parameter></${B}｜DSML｜${B} invoke></${B}｜DSML｜${B} calls>`,
+    '中间',
+    `<${B}｜DSML｜${B} calls><${B}｜DSML｜${B} parameter name="command">junk</${B}｜DSML｜${B} parameter></${B}｜DSML｜${B} invoke></${B}｜DSML｜${B} calls>`
+  ].join('\n');
+  const { calls, rest } = parseLeakedCalls(two);
+  assert.equal(calls.length, 1, 'exactly the named envelope yields a call');
+  assert.equal(calls[0].name, 'read_file');
+  assert.equal(rest.includes('junk'), false, 'the unnamed envelope is still dropped');
+  assert.equal(rest.includes('中间'), true, 'prose between them survives');
+});
