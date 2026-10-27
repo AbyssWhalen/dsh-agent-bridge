@@ -96,3 +96,32 @@ test('clean history is byte-identical to what it was', () => {
   assert.equal(flattenConversation(history).endsWith('which is larger'), true, 'the instruction is still the tail');
   assert.equal(appendPrompt(history, 'which is larger'), 'list the files\n\nalpha.txt and beta.txt\n\nwhich is larger');
 });
+
+test('every path that renders history to a model scrubs it', async () => {
+  // The audit, as a test. There are four ways a stored turn can reach a model, and each was
+  // checked by hand once; this is what stops a fifth being added without one.
+  //
+  //   flattenTranscript    -> the Qoder cold-child replay
+  //   flattenConversation  -> the Qoder prompt body
+  //   appendPrompt         -> the Qoder appended tail
+  //   toWireMessages       -> WorkBuddy's native request body (already scrubbed before this)
+  //
+  // `splitSystem` reads only system turns, which the harness writes and a model never does,
+  // and `messageFingerprint` never leaves the process — both are deliberately out of scope.
+  const { toWireMessages } = await import('../drivers/workbuddy/conversation.js');
+  const history = [user('go'), assistant(`Checking. ${LEAKS['native DSML']}`), user('and again')];
+
+  const rendered = {
+    flattenTranscript: flattenTranscript(history),
+    flattenConversation: flattenConversation(history),
+    appendPrompt: appendPrompt(history, 'and again'),
+    // The region only picks an endpoint; the body is what matters here.
+    toWireMessages: JSON.stringify(toWireMessages(history, 'cn'))
+  };
+
+  const failures = Object.entries(rendered)
+    .filter(([, out]) => MARKUP.test(out))
+    .map(([name, out]) => `${name} -> ${JSON.stringify(out.slice(0, 120))}`);
+  assert.deepEqual(failures, [], `a replay path still teaches the markup:\n${failures.join('\n')}`);
+  assert.equal(Object.keys(rendered).length, 4, 'the audit covers every rendering path');
+});
