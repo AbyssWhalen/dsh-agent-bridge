@@ -64,7 +64,9 @@ async function turn(deltas, split = false) {
     // assembled call; there is no plain `tool-call` frame.
     calls: chunks
       .filter((c) => c.type === 'block-end' && c.block?.type === 'tool-call')
-      .map((c) => ({ name: c.block.name, args: c.block.arguments }))
+      .map((c) => ({ name: c.block.name, args: c.block.arguments })),
+    // The failure, when the turn has one: what the user is told is part of the behaviour.
+    errors: chunks.filter((c) => c.type === 'error').map((c) => String(c.error?.message ?? c.error))
   };
 }
 
@@ -144,6 +146,22 @@ test('a reply opening with a stray tag shows no markup', async () => {
   const { text, calls } = await turn(['<parameter name="command">Get-Date']);
   assert.equal(calls.length, 0);
   assert.equal(/parameter|</u.test(text), false, `markup reached the user: ${JSON.stringify(text)}`);
+});
+
+test('an empty turn says the markup was dropped, not that the runtime answered nothing', async () => {
+  // Both failures end the turn with no text, and both used to report the same thing: "the
+  // runtime finished the turn without producing any content". That blames the worker for a
+  // decision this driver made, and sends anyone debugging it to the wrong component — the
+  // turn the user described as "blocked" looked exactly like a broken runtime. The two are
+  // different: one is a model that wrote call syntax it could not recover, the other is a
+  // worker that answered with nothing, and only the first is worth retrying as-is.
+  const { text, errors } = await turn(['<invoke name="pwsh">']);
+  assert.equal(text, '', 'nothing readable survives, which is the premise');
+  assert.equal(errors.length, 1, `expected one failure; got ${JSON.stringify(errors)}`);
+  assert.doesNotMatch(errors[0], /runtime finished the turn without producing any content/u, 'that message is reserved for a genuinely empty turn');
+  assert.match(errors[0], /call syntax/u, `the cause must be named; got ${JSON.stringify(errors[0])}`);
+  assert.match(errors[0], /pwsh/u, 'and the opening tag names what the model was reaching for');
+  assert.match(errors[0], /retry/u, 'because retrying is the actionable part');
 });
 
 test('prose that merely mentions a tag keeps its words', async () => {

@@ -446,6 +446,17 @@ export class QoderConversation {
     let holding = false;
     /** Reasoning gets the same marker guard; nothing is recovered from it. */
     let pendingReasoning = '';
+    /**
+     * What an unrecoverable call block threw away, if anything.
+     *
+     * The block itself must not reach the user — that is the whole point of the guard — but
+     * discarding it silently makes the turn indistinguishable from a runtime that produced
+     * nothing at all. That was the actual behaviour: the turn ended with "the runtime
+     * finished the turn without producing any content", which blames the worker for a
+     * decision this file made, and leaves no way to tell a stuck model from a stuck plugin.
+     * Keeping the size and the first tag lets the empty-turn error say what happened.
+     */
+    let discarded = undefined;
 
     // The runtime's block indices address a different numbering than the
     // harness's, and a single turn can interleave reasoning and text blocks; a
@@ -588,6 +599,12 @@ export class QoderConversation {
           emitText(raw, 0);
           return;
         }
+        // Remember what was dropped, so an otherwise-empty turn can explain itself instead
+        // of blaming the runtime. The tool name is the useful part: "the model was reaching
+        // for `pwsh` and could not finish the block" tells the user what to retry, while
+        // "opening tag `invoke`" only restates the syntax they cannot see.
+        const wanted = /name\s*=\s*["']?([A-Za-z0-9_.-]+)/u.exec(raw);
+        discarded = { size: raw.length, tool: wanted?.[1] };
         if (recovered.rest.length > 0) emitText(recovered.rest, 0);
         return;
       }
@@ -729,7 +746,16 @@ export class QoderConversation {
         // not at all. Finished as `stop`, an empty turn is a blank answer the caller cannot
         // act on, and the same indistinguishability from a refusal the comment above names.
         if (!delivered()) {
-          queue.fail(emptyTurn('qoder: the runtime finished the turn without producing any content'));
+          // Name the real cause. Two different failures end here, and reporting both as
+          // "the runtime produced nothing" sends the user to the wrong place: one is a
+          // worker that answered with nothing, the other is a model that wrote call markup
+          // this file refused to show. The second is retryable in a way the first is not.
+          const reason =
+            discarded === undefined
+              ? 'qoder: the runtime finished the turn without producing any content'
+              : `qoder: the model wrote call syntax as text and none of it could be recovered, so the turn was discarded to keep the markup off the screen (${discarded.size} characters${discarded.tool === undefined ? '' : `, reaching for \`${discarded.tool}\``}); retry the turn`;
+          this.#logger?.warn?.(reason);
+          queue.fail(emptyTurn(reason));
           return;
         }
         // A cut-off turn is not a finished one, and it outranks "there were tool calls": a call
