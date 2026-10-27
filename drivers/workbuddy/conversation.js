@@ -21,10 +21,12 @@ import {
   endsWithMarkerPrefix,
   hasLeak,
   hasNativeLeak,
+  hasUnclosedCallMarkup,
   isDegenerate,
   MARKER_MAX,
   parseLeakedCalls,
-  stripLeak
+  stripLeak,
+  truncateOpenMarkup
 } from '../../lib/dsml.js';
 import { assistantProse, flattenConversation, messageText, splitSystem, toolCallsOf } from '../../lib/messages.js';
 import { UpstreamFailure, classifyUpstreamError } from './upstream.js';
@@ -279,8 +281,18 @@ export class WorkBuddyConversation {
     const acceptReasoning = (delta) => {
       pendingReasoning += delta;
       if (hasLeak(pendingReasoning)) {
-        // Hold until the block is complete, then drop it wholesale.
-        if (/\[tool call:[^\]]*\]/u.test(pendingReasoning) || /<\/[\uFF5C|]{2}\s*DSML[\s\S]*?$/u.test(pendingReasoning)) {
+        // Hold until the block is closed, then drop it wholesale.
+        //
+        // "Closed" has to be asked as a question about the *block*, not about whether some
+        // closing marker has been seen. The previous test looked for `</｜｜DSML…` anywhere
+        // near the end, so the instant that fragment arrived — with the rest of the block
+        // still to come — it stripped what it had, cleared the buffer, and released the
+        // remainder as ordinary reasoning. Measured with one-character deltas:
+        // `｜｜parameter></｜｜DSML｜｜invoke>` reached the caller. The two predicates below
+        // are the same ones the text channel and the Qoder driver use, so a spelling the
+        // parser learns is understood here without a second implementation.
+        const toolCallStillOpen = /\[tool call:[^\]]*$/u.test(pendingReasoning);
+        if (!toolCallStillOpen && !hasUnclosedCallMarkup(pendingReasoning) && !endsWithMarkerPrefix(pendingReasoning)) {
           const cleaned = stripLeak(pendingReasoning);
           if (cleaned.length > 0) {
             sawReasoning = true;
@@ -303,7 +315,9 @@ export class WorkBuddyConversation {
     /** Release reasoned text that was held back, then drop any markup in it. */
     const settleReasoning = () => {
       if (pendingReasoning.length === 0) return;
-      const cleaned = hasLeak(pendingReasoning) ? stripLeak(pendingReasoning) : pendingReasoning;
+      // Truncate first: an unclosed block is left alone by `stripLeak` on purpose, and at
+      // the end of a turn leaving it alone means showing it.
+      const cleaned = hasLeak(pendingReasoning) ? stripLeak(truncateOpenMarkup(pendingReasoning)) : pendingReasoning;
       if (cleaned.length > 0) {
         sawReasoning = true;
         queue.push({ type: 'reasoning-delta', index: reasoningIndex, text: cleaned });

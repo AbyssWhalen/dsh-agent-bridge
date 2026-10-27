@@ -34,7 +34,8 @@ import {
   isDegenerate,
   MARKER_MAX,
   parseLeakedCalls,
-  stripLeak
+  stripLeak,
+  truncateOpenMarkup
 } from '../../lib/dsml.js';
 import { emptyTurn, noticedFailure } from '../../lib/failure.js';
 import { appendPrompt, flattenTranscript, isStraightAppend, messageFingerprint, splitSystem } from '../../lib/messages.js';
@@ -677,7 +678,11 @@ export class QoderConversation {
       heldReasoning = '';
       pendingReasoning = '';
       holdingReasoning = false;
-      const cleaned = stripLeak(raw);
+      // Truncate before stripping: a block that never closed survives `stripLeak` on
+      // purpose, because for history a half-written form is more likely prose about the
+      // syntax than a truncated call. At the end of a turn it is the opposite, and showing
+      // it is the leak this whole hold exists to prevent.
+      const cleaned = stripLeak(truncateOpenMarkup(raw));
       if (cleaned.length === 0) return;
       reasoningSeen = true;
       queue.push({ type: 'reasoning-delta', index: indexFor(workerIndex, 'reasoning'), text: cleaned });
