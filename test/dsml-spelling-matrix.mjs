@@ -15,7 +15,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { hasNativeLeak, parseLeakedCalls } from '../lib/dsml.js';
+import { hasNativeLeak, parseLeakedCalls, stripLeak } from '../lib/dsml.js';
 
 const B = '\uFF5C';
 
@@ -141,4 +141,33 @@ test('prose with angle brackets and bars is not a call', () => {
     assert.equal(hasNativeLeak(prose), false, `false positive: ${JSON.stringify(prose)}`);
     assert.equal(parseLeakedCalls(prose).calls.length, 0, `invented a call from ${JSON.stringify(prose)}`);
   }
+});
+
+test('replayed history loses the markup in every spelling', () => {
+  // `stripLeak` is the other half of the product: it is what runs over an assistant turn
+  // pulled back out of history. Leaving markup there is how a single leak becomes a habit —
+  // a model shown its own tags imitates them — so the sweep has to hold for the stripping
+  // pass too, not only for recovery.
+  const failures = [];
+  let combinations = 0;
+
+  for (const [envName, env] of Object.entries(ENVELOPES)) {
+    for (const [dName, d] of Object.entries(DELIMITERS)) {
+      for (const [opName, op] of Object.entries(OPENERS)) {
+        for (const [paName, pa] of Object.entries(PARAMS)) {
+          for (const [clName, cl] of Object.entries(CLOSERS)) {
+            combinations += 1;
+            const body = `before ${env(d)}${op(d)}${pa(d)}${cl(d)}`;
+            const cleaned = stripLeak(body);
+            if (MARKUP_IN_TEXT.test(cleaned)) {
+              failures.push(`${envName}/${dName}/${opName}/${paName}/${clName} -> ${JSON.stringify(cleaned.slice(0, 60))}`);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  assert.ok(combinations > 3000, `the sweep is meant to be broad; saw ${combinations}`);
+  assert.deepEqual(failures, [], `${failures.length} of ${combinations} spellings survive stripping:\n${failures.slice(0, 10).join('\n')}`);
 });
