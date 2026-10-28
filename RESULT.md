@@ -220,11 +220,71 @@ dfmodel 前面排 9741 个请求，预计 54 分钟。账户在扣（实测 2493
 提到的 `*DSML*` 文件名都算成污染，得出"154/258 被污染"的虚高数字。改成"值内出现标记标签
 （`<` 或 `</` 紧跟栏）"后才是 138。
 
+### 第三种形态：只写开标签，一个闭合都没有（F-081）
+
+用户第二次报告，样本是「一条命令 + 三个参数值各占一行，没有任何标记，也没有执行」：
+
+    $t="D:\...\T20261028-04-iis6-cred-hunt"; Get-ChildItem $t -Recurse -File | ForEach-Object { ... }
+    List files in active task dir
+    30000
+    D:\DshWork\CyberWork
+
+以及 `parameter name="timeoutMs" string="false">30000D:\DshWork\CyberWork`——`workdir` 的开标签
+被当成标记剥掉了，它的值留了下来贴在上一行末尾。
+
+在 `session-87c61dd3` 的 turn 27 step 2 找到对应记录：`assistant/message` 的 text 块正是这四行，
+后面直接跟 `step/end`、`turn/end`，**中间没有 `tool/call`**。也就是说命令根本没执行，只是被显示
+出来了——比执行失败更糟，用户会以为跑过了。
+
+模型写的是这个形状（开标签齐全，闭合一个都没有）：
+
+    <｜｜DSML｜｜ invoke name="pwsh">
+    <｜｜DSML｜｜ parameter name="command" string="true">Get-ChildItem $t …
+    <｜｜DSML｜｜ parameter name="description" string="true">List files in active task dir
+    <｜｜DSML｜｜ parameter name="timeoutMs" string="false">30000
+    <｜｜DSML｜｜ parameter name="workdir" string="true">D:\DshWork\CyberWork
+
+两处独立失效：
+
+1. `SEPARATOR_CLOSED_PARAMETER` 的取值终止条件只有「分隔符 / `</parameter>` / `</invoke>` /
+   字符串结尾」，**不认下一个参数的开标签**。于是 `command` 一路吞到末尾，把后面三个参数当成
+   字面标记收进自己的值里。
+2. 没有 `invoke` 名字可恢复时，标记被剥离、**值却作为正文活了下来**并显示给用户。
+
+修法：给终止条件加 `PARAMETER_OPENER_LOOKAHEAD`；另加 `orphanArgumentSpans`，在「没能恢复出
+任何调用」时把无人认领的参数块整段切掉。后者只在 `calls.length === 0` 时生效——一旦有调用，
+它自己的 span 已经覆盖了参数。
+
+**边界**：`prose-safety` 与 `dsml-nameless-envelope` 两个既有测试立刻抓到第一版的过度切割——
+终止符只认 `</parameter>` 和 `</invoke>`，导致无名 `calls` 信封之后的散文被一起吃掉。改成认任意
+闭合标签 `</${SEG}` 后恢复。这正是"改了要证明没弄坏别的"的价值。
+
+新增 `test/qoder-opener-only.mjs`，5 项断言；**反向验证**：分别移除两处修复，各自变红
+（第 1 处红 1 项，第 2 处红 2 项），哈希前后一致（`983c4d5f9109f198`）。
+
+真机四参数验证 3/3：`command` / `description` / `timeoutMs` / `workdir` 四个独立参数，
+`timeoutMs` 正确转成 number，`{0,-9}` 格式串完好，文本通道零泄漏。其中一轮客户端 90 秒超时，
+加长预算单独重跑后 11.2 秒成功——是拥塞，不是缺陷。
+
 ### 另一条：乱码输出不是插件造成的
 
 用户贴的样本里 `-` 变成 `−`(U+2212)、`'` 变成 `′`(U+2032)、`$` 消失、`20_archive` 断成
 `20 / a / rchive`。这些都是 **Markdown + 数学渲染**的特征：`$…$` 之间按 LaTeX 排版
 （`-` 是减号、`'` 是撇号、空格被忽略），`_a_` 被当成斜体吃掉下划线。
+
+第二次报告里这条机制可以精确对上。原命令是：
+
+    $t="D:\DshWork\CyberWork\10_active\..."; Get-ChildItem $t -Recurse -File | ForEach-Object { "{0,-9} {1}" -f $_.Length, $_.FullName }
+
+第一个 `$` 开数学区、第二个 `$`（`Get-ChildItem $t` 的那个）闭数学区，中间那一整段被当公式排版：
+
+| 屏幕上 | 真实字符 | 原因 |
+| --- | --- | --- |
+| `t="D:\…";Get-ChildItemt` | 两端各有一个 `$` | 数学定界符被吃掉 |
+| `2026−10` | `2026-10` | 减号变 U+2212 |
+| `10 a rchive` | `10_archive` | 数学斜体把字母分开、下划线消失 |
+| `. L e n g t h` | `$_.Length` | 同上 |
+| `{0,−9}` | `{0,-9}` | 减号变 U+2212 |
 
 证据：对全部 10 个会话做指纹检索，带 `−` 的 `2026−10` **只出现在当前会话**（用户粘贴 +
 本文引用）；CyberWork 两个会话里 `2026-10` 分别是 1209 和 937 次，**全部是正常 ASCII**。
