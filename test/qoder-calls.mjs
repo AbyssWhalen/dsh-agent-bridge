@@ -75,8 +75,18 @@ check('parameter names and requirements are stated', () => {
   assert(preamble.includes('file_path (string, required)'), 'file_path not described as required');
 });
 check('the call syntax is shown exactly once', () => {
-  const opens = preamble.split(`<${MARK}DSML${MARK} calls>`).length - 1;
+  // The taught form is one `invoke` envelope holding one JSON payload. The per-parameter dialect it
+  // replaced also showed a `calls` wrapper; the payload form does not need one.
+  const opens = preamble.split(`<${MARK}DSML${MARK} invoke name=`).length - 1;
   assert(opens === 1, `expected one syntax example, saw ${opens}`);
+  // Count only the example, where the opener is immediately followed by the payload's `{`. The
+  // prose explains the tags and mentions the opener too, so a plain count double-counts it.
+  const payloads = preamble.split(`<${MARK}DSML${MARK} arguments>{`).length - 1;
+  assert(payloads === 1, `expected one payload example, saw ${payloads}`);
+  assert(
+    !preamble.includes(`<${MARK}DSML${MARK} parameter name=`),
+    'the preamble teaches one tag per parameter again, which is the ambiguity the JSON payload removes'
+  );
 });
 check('an empty tool list adds nothing', () => {
   assert(toolPreamble([]).trim() === '' || !toolPreamble([]).includes('## '), 'empty list produced sections');
