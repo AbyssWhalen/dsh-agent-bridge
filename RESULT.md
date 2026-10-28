@@ -346,6 +346,91 @@ JSON 却漏掉 `</arguments>`。前者无解——一个吞了后续参数的字
 `test/qoder-calls.mjs` 的"语法只示范一次"原本数的是 `calls>` 信封，随格式一起改成数
 `invoke name=` 与载荷示例，并新增一条断言：提示词里不得再出现每参数一标签的示例。
 
+### 积分"实时同步"曾经是假的（F-083）
+
+用户最初的两件事里，第二件是「实时积分情况也要做好同步」。复查时发现它一直是坏的，
+而且坏得看不见——所有只读检查都会通过。
+
+#### 怎么发现的
+
+先证明读得通：`providerInfo().name` 上确实有真数字。
+
+    WorkBuddy · 7,255 积分
+    Qoder · 1,752 credits left
+
+再证明刷得动——给 `catalog.refreshQuota` 加计数包装，跑一个 turn：
+
+    calls before the turn: 0
+    refreshQuota calls during the turn: 1
+    last result: {"remaining":1752,...,"used":1048}
+
+接线是通的，turn 后确实刷了一次。但**两次返回的数字一样**。当时最容易就此收工，写一句
+「可能模型免费」。不能这么收。
+
+#### 根因
+
+`drivers/workbuddy/index.js`：
+
+```js
+export const CREDIT_TTL_MS = 60 * 1000;
+
+async quota(options = {}) {
+  if (options.fresh !== true && cachedCredits !== undefined && ...) {
+    return cachedCredits.value;   // ← 命中缓存，返回 turn 之前的数字
+  }
+```
+
+而 `lib/index.js` 的接线上：
+
+```js
+quota: driver.quota === undefined ? undefined : () => driver.quota(),
+//                                                 ↑ fresh 在这里被丢掉了
+```
+
+于是 `refreshQuota()` 每次都在 60 秒窗口内命中缓存，把**花掉积分之前**的数字当成新的
+发布出去。turn 后立刻看，看到的是旧数字——正是「没同步」的手感。
+
+驱动缓存本身是合理的：计费端点是用户自己账户上的计费调用，模型选择器每次渲染都问一次会
+把请求打爆。错的是刷新时不告诉它「这次要新的」。
+
+对比：Qoder 的 `quota()` 没有缓存，每次都真读。所以只有 WorkBuddy 受影响。
+
+#### 修法
+
+- `lib/index.js`：把接线抽成具名可测的 `quotaReader(driver)`，`fresh` 透传。
+  抽出来是因为它埋在 `mount` 里就测不到——要测一行参数传递得先起一个真厂商。
+- `lib/catalog.js`：`refreshQuota()` 传 `true`（这是花完钱之后的刷新，缓存毫无意义）；
+  定时 `refresh()` 传 `false`（省一次计费调用，下一轮缓存反正也过期了）。
+
+#### 验证
+
+新增 `test/quota-fresh.mjs`，6 项，用一个按 WorkBuddy 方式记忆 60 秒的假驱动：
+
+- turn 后刷新必须拿到新值（旧值 100 → 新值 40）
+- 去掉 fresh 时必须拿不到新值（复现缺陷本身，否则前一条没在测东西）
+- 刷新失败保留上次的数字，不把 header 清空
+- 并发刷新只打一次计费端点
+- 接线把 flag 原样送到驱动（`true` / `false` / `undefined` 三种）
+- 没有余额的厂商不贡献读取器
+
+**反向验证**：把 `#readQuota(true)` 改回无参 → 红 2 项；把 `quotaReader` 改回丢弃 flag
+→ 红 1 项；哈希前后一致。
+
+第一版反向验证暴露了一个真问题：`lib/index.js` 那半边**不红**——因为测试直接构造
+`Catalog` 并自己传 `(fresh) => driver.quota({ fresh })`，绕过了插件自己的接线。也就是说
+原来的 bug 位置之一完全没被覆盖。这才有了把接线抽成 `quotaReader` 并单独测试。
+
+#### 修复后数字为什么还是不动
+
+跑了 turn，WorkBuddy 仍是 7255、Qoder 仍是 1752 / used 1048。现在每次都是真读（缓存绕过了），
+所以这不是同步问题，是计费粒度：
+
+- WorkBuddy 的 `remain` 是整数，`x0.11 credits` 是一次调用的倍率，1.6 秒的 flash turn 花不到 1 积分
+- Qoder 的 `remaining` 同样是整数
+
+**能证明的**：读路径是活的、turn 后确实触发、强制新鲜、并发不放大。
+**不能证明的**：厂商到底扣没扣——这需要跨足够多的 turn 才看得见。报告里不写「已验证扣费」。
+
 ### 另一条：乱码输出不是插件造成的
 
 用户贴的样本里 `-` 变成 `−`(U+2212)、`'` 变成 `′`(U+2032)、`$` 消失、`20_archive` 断成
