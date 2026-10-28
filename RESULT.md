@@ -184,6 +184,42 @@ dfmodel 前面排 9741 个请求，预计 54 分钟。账户在扣（实测 2493
   （`$a = 3; "a is $a"; [char[]]'abc…' | Select-Object -First 5` → 输出 `a is 3 / a / b / c / d / e`）
 - 破坏性对比：修复前那条命令 exit 1（`术语 '<' 不会被识别为 cmdlet`），修复后 exit 0
 
+### 第二种形态：一个标签同时闭合与开启（F-080b）
+
+真实会话里还有 8 处这样的写法：
+
+    …20261027-fofa-idle-batch.sh</｜｜DSML｜｜ parameter name="old_string">  echo "…
+
+`file_path` 的值末尾那个标签既是前一个参数的闭合，又带着下一个参数的属性。任何只看闭合的
+规则都匹配不了它。效果与 F-080a 相同：值把下一个参数吞成字面标记，工具收到一个尾巴带标签
+的文件名，编辑被拒。
+
+修法：在规范化阶段先把它拆成 `</X><X parameter …>`——解析器本来就懂这个形式，拆分只是把
+模型的意图说明白。前瞻断言 `(?=(?:name|parameter|key)\s*[=:])` 保证正常闭合
+（`</… parameter>` 后面没有属性）不受影响。
+
+新增 `test/qoder-close-as-open.mjs`，4 项断言；**反向验证**：从 `normalizeCallSyntax` 中
+移除该步骤后 2 项变红，哈希前后一致（`6b1d563e4d0731d2`）。
+
+真机验证时发现一个方法陷阱：第一次跑三种形态，模型在第 2 轮自己选了 `pwsh` 而不是 `edit`，
+于是"3/3 通过"并没有测到第二种形态。改成只提供 `edit` 一个工具、强制选择后重测，
+3/3 才真正走通（`file_path` / `old_string` / `new_string` 三个独立参数，
+多行且含 `========` 的 `old_string` 完好）。
+
+### 用真实日志度量修复效果
+
+把会话里记录下来的参数值原样当作输入（记录值就是"原文去掉开标签"，不需要重构分隔符），
+重新解析后看值内是否还残留标签：
+
+    会话 session-87c61dd3 工具调用总数            258
+      仅提到 DSML 一词、无标签（本来就干净）        2
+      值内含真实标记标签（真污染）                138
+      修复后恢复为干净值                        138/138 = 100%
+
+判据修正过程也有教训：第一版用 `[｜|]{2}|DSML` 作判据，把 shell 的 `||` 或运算符和命令里
+提到的 `*DSML*` 文件名都算成污染，得出"154/258 被污染"的虚高数字。改成"值内出现标记标签
+（`<` 或 `</` 紧跟栏）"后才是 138。
+
 ### 另一条：乱码输出不是插件造成的
 
 用户贴的样本里 `-` 变成 `−`(U+2212)、`'` 变成 `′`(U+2032)、`$` 消失、`20_archive` 断成
@@ -227,6 +263,15 @@ dfmodel 前面排 9741 个请求，预计 54 分钟。账户在扣（实测 2493
 11. **改配置脚本要验证替换真的命中**。`p.scripts.check.replace('test/qoder-queue.mjs', …)`
     在 `check` 里根本不存在这个串，静默无操作；靠 `git diff` 零输出才发现。加锚点断言与
     "replace 是否改变字符串"的检查后才算改对。
+12. **判据里的字符类会把普通语法当成污染**。统计污染率时用 `[｜|]{2}|DSML`，而 shell 的
+    `||` 或运算符、命令里提到的 `*DSML*` 文件名都被算进来，得出 154/258 的虚高数字。
+    改成"值内出现标记标签"后是 138。**判据宽一格，结论就偏一个量级。**
+13. **绿了要先问"它测到了我说它测的东西吗"**。真机验证三种形态，第 2 轮模型自己改选了
+    `pwsh`，于是"3/3 通过"里根本没有第二种形态。只提供 `edit` 一个工具强制选择后重测，
+    才是真的 3/3。这已是本项目第三次栽在"绿测试没测到目标"上。
+14. **测试用例本身可能要求一件做不到的事**。我写过一个"值里字面包含闭合标签仍要完整保留"
+    的用例——字节上与真正的闭合完全相同，任何解析器都无法区分。这种用例不是发现了缺陷，
+    是把不可能当成需求。删掉并在注释里写明原因。
 
 ## 四、未决项
 
@@ -248,8 +293,8 @@ dfmodel 前面排 9741 个请求，预计 54 分钟。账户在扣（实测 2493
 - 新增测试：`test/dsml-spelling-matrix.mjs`、`test/dsml-stream-matrix.mjs`、
   `test/qoder-reasoning.mjs`、`test/workbuddy-reasoning.mjs`、`test/history-scrub.mjs`、
   `test/prose-safety.mjs`、`test/quota-refresh.mjs`、`test/qoder-queue.mjs`、
-  `test/qoder-bare-close.mjs`（F-080）
-- 测试总数 76，`npm run check` exit 0
+  `test/qoder-bare-close.mjs`（F-080a）、`test/qoder-close-as-open.mjs`（F-080b）
+- 测试总数 77，`npm run check` exit 0
 - 已同步到 `~/.dsh/profiles/desktop/node_modules/dsh-agent-bridge/`，哈希一致
 - 缺陷编号 F-001…F-080 全部处理完毕
 - 真实会话取证工具：`tools/_session.mjs`（按帧解 zstd）、`tools/_fingerprint.mjs`
