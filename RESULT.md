@@ -1,12 +1,14 @@
 # RESULT — dsh-agent-bridge 标记泄漏与配额同步
 
-更新时间：2026-10-27（W2 收工验收）
-状态：用户报的两个问题（标记泄漏、实时积分同步）均已修复，有可复现的红→绿测试，
-      并经用户两次重启后在真机上验收：两个驱动各 6/6 可用、0 泄漏、工具参数逐字节一致。
+更新时间：2026-10-28（F-080 收工）
+状态：用户报的问题均已定位。F-080（参数闭合标签缺 `parameter` 一词）已修复并有红→绿测试，
+      真机 3/3 验证通过。另查明"乱码"是宿主 Markdown 渲染所致，非插件缺陷。
 
 ## 一、用户报的现象与真实原因
 
 原始描述："用 Qoder 反代模型经常输出那一大串…有时候还会被那些东西阻断输出"。
+后续追加："在 CyberWork 里面的对话调用 Qoder 的 deepseek 还是总出现问题，比如输出被停止，
+还有这种乱七八槽的输出：[乱码样本]"
 
 拆成两类，根因完全不同：
 
@@ -125,6 +127,76 @@ dfmodel 前面排 9741 个请求，预计 54 分钟。账户在扣（实测 2493
 追查确认是探针脚本用字面量 `ok` 当工具返回值所致；换成真实多行工具输出后，模型正确
 转述了 `Get-Date` 的结果，无任何抱怨。非插件缺陷。
 
+## 二·补 F-080：参数闭合标签缺 `parameter` 一词（真正的功能性缺陷）
+
+用户第二次报障后，不再靠合成样本猜，改为直接解码真实会话日志（`session.v4.jsonl.zstd`
+是 zstd 追加流，按小端 magic `0x28 B5 2F FD` 切帧后逐帧解压）。
+
+### 两条报障其实同源
+
+日志里 `session-87c61dd3`（CyberWork，1407 行）有一条决定性的失败记录：
+
+    "type":"llm/retry"  … "failure": {
+      "message": "qoder: the model wrote call syntax as text and none of it could be
+                  recovered … (353 characters, reaching for `command`)",
+      "code": "EMPTY_RESPONSE" }
+
+这就是"输出被停止"。同一会话里还有真正执行过的工具调用：
+
+    {"command": "ssh jp '… nproc'</｜｜DSML｜｜>\n
+     <｜｜DSML｜｜ parameter name=\"description\" …>Check apt packages …</｜｜DSML｜｜>\n
+     <｜｜DSML｜｜ parameter name=\"timeoutMs\" …>90000</｜｜DSML｜｜>\n"}
+
+`command` 长 237 字符，把另外两个参数当成字面标记吞了进去。
+
+### 原因
+
+`lib/dsml.js` 的 `PARAMETER` 正则注释原文写着"`parameter` 在开标签上可选，在**闭**标签上必需"。
+但真实数据里模型绝大多数时候写的是不带该词的裸闭合 `</｜｜DSML｜｜>`。逐帧普查 CyberWork 会话：
+
+| 闭合拼写 | 次数 |
+| --- | --- |
+| `</｜｜DSML｜｜>`（裸） | **3151** |
+| `</｜｜DSML｜｜ parameter>`（带词） | 92 |
+
+差 34 倍。闭合匹配不上，`[\s\S]*?` 就一路吞到下一个带词闭合或块尾：
+
+- **多参数**：第一个参数吞掉其余全部 → 命令带标记 → shell 报语法错 → 执行失败
+- **单参数**：`parametersOf` 返回 `{}` → 调用被丢弃 → `EMPTY_RESPONSE` → 输出被停止
+
+一个正则，两个症状。
+
+### 修法
+
+闭合处的 `parameter` 改为可选：
+
+    `…([\s\S]*?)</${SEG}\s*(?:parameter\s*)?>`
+
+安全性：`</｜｜DSML｜｜ invoke>` 和 `</｜｜DSML｜｜ calls>` 在该位置都有词，`\s*>` 要求紧跟
+`>`，因此不会被误当参数闭合。
+
+### 验证
+
+- 新增 `test/qoder-bare-close.mjs`，5 项断言，覆盖普查到的 8 种闭合拼写
+  （裸 / 单栏 / 三栏 / 带词 / 无空格带词 / ASCII 双竖线 等）
+- **反向验证**：去掉修复后 5 项全红；工作区哈希前后均为 `31a98e395ea0acb5`，恢复自校验通过
+- 真机 3/3：每次都是三个独立参数、值内零标记、`$a` 完好
+  （`$a = 3; "a is $a"; [char[]]'abc…' | Select-Object -First 5` → 输出 `a is 3 / a / b / c / d / e`）
+- 破坏性对比：修复前那条命令 exit 1（`术语 '<' 不会被识别为 cmdlet`），修复后 exit 0
+
+### 另一条：乱码输出不是插件造成的
+
+用户贴的样本里 `-` 变成 `−`(U+2212)、`'` 变成 `′`(U+2032)、`$` 消失、`20_archive` 断成
+`20 / a / rchive`。这些都是 **Markdown + 数学渲染**的特征：`$…$` 之间按 LaTeX 排版
+（`-` 是减号、`'` 是撇号、空格被忽略），`_a_` 被当成斜体吃掉下划线。
+
+证据：对全部 10 个会话做指纹检索，带 `−` 的 `2026−10` **只出现在当前会话**（用户粘贴 +
+本文引用）；CyberWork 两个会话里 `2026-10` 分别是 1209 和 937 次，**全部是正常 ASCII**。
+即落盘的命令字符完全正确，只有屏幕显示被渲染坏。
+
+宿主 `app.asar` 内含 katex，确认存在数学渲染。此问题在 GUI 渲染层，插件侧不改文本是对的
+（改文本会让真正需要渲染的内容也坏掉）。
+
 ## 三、过程中的方法教训（已写入提交信息）
 
 1. **判据写错拼法是静默失效**。`hasUnclosedCallMarkup` 第一版数 ASCII `|`，而规范化器
@@ -147,6 +219,14 @@ dfmodel 前面排 9741 个请求，预计 54 分钟。账户在扣（实测 2493
 8. **测试的判据和被测代码一样可能出错**。`history-scrub` 原来用手写正则作判据，列了
    `invoke`/`parameter` 却漏了 `tool_call`/`antml`，导致新增的三个用例根本没被检查，
    反向验证假通过。改为调用模块自己的 `hasLeak`。
+9. **合成样本猜不出真实缺陷，去读真实日志**。前两轮我用自己编的命令测，结论都是"插件干净"，
+   而用户照旧报障。改成解码真实会话日志后，一次就拿到 `llm/retry` 的失败记录、被污染的
+   `tool/call` 参数、以及 3151:92 的闭合拼写比例。**报障原文本身就是最好的 fixture。**
+10. **普查有限的状态空间，别一种形态一种形态地补**。闭合标签的拼写是有限集，逐帧计数一次
+    就看出哪一种是主流（裸闭合 3151 次）。此前每轮补一种拼写的做法必然输给它。
+11. **改配置脚本要验证替换真的命中**。`p.scripts.check.replace('test/qoder-queue.mjs', …)`
+    在 `check` 里根本不存在这个串，静默无操作；靠 `git diff` 零输出才发现。加锚点断言与
+    "replace 是否改变字符串"的检查后才算改对。
 
 ## 四、未决项
 
@@ -167,8 +247,12 @@ dfmodel 前面排 9741 个请求，预计 54 分钟。账户在扣（实测 2493
   `drivers/qoder/conversation.js`、`drivers/workbuddy/conversation.js`
 - 新增测试：`test/dsml-spelling-matrix.mjs`、`test/dsml-stream-matrix.mjs`、
   `test/qoder-reasoning.mjs`、`test/workbuddy-reasoning.mjs`、`test/history-scrub.mjs`、
-  `test/prose-safety.mjs`、`test/quota-refresh.mjs`、`test/qoder-queue.mjs`
-- 测试总数 75，`npm run check` exit 0
+  `test/prose-safety.mjs`、`test/quota-refresh.mjs`、`test/qoder-queue.mjs`、
+  `test/qoder-bare-close.mjs`（F-080）
+- 测试总数 76，`npm run check` exit 0
 - 已同步到 `~/.dsh/profiles/desktop/node_modules/dsh-agent-bridge/`，哈希一致
-- 缺陷编号 F-001…F-079 全部处理完毕
+- 缺陷编号 F-001…F-080 全部处理完毕
+- 真实会话取证工具：`tools/_session.mjs`（按帧解 zstd）、`tools/_fingerprint.mjs`
+  （指纹定位）、`tools/_spellings.mjs`（闭合拼写普查）、`tools/_counter-bare.mjs`
+  （自校验反向验证）
 
