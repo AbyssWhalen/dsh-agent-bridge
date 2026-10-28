@@ -1,7 +1,8 @@
 # RESULT — dsh-agent-bridge 标记泄漏与配额同步
 
-更新时间：2026-10-27
-状态：用户报的两个问题（标记泄漏、实时积分同步）均已修复并有可复现的红→绿测试。
+更新时间：2026-10-27（W2 收工验收）
+状态：用户报的两个问题（标记泄漏、实时积分同步）均已修复，有可复现的红→绿测试，
+      并经用户两次重启后在真机上验收：两个驱动各 6/6 可用、0 泄漏、工具参数逐字节一致。
 
 ## 一、用户报的现象与真实原因
 
@@ -96,6 +97,34 @@ dfmodel 前面排 9741 个请求，预计 54 分钟。账户在扣（实测 2493
 配额同步实测生效（Qoder 2036→2035）。参数保真用 149 字符含引号、反斜杠、制表符、
 中文、emoji、代理对的载荷验证，两个驱动都逐字节一致。
 
+### 最终验收（用户两次重启后的收工检查）
+
+代码一致性：7 份关键文件哈希与仓库逐个比对，0 差异 —— 加载的确实是 `2dc5a0c`。
+
+两个驱动各 6 轮普通请求（含 3 条会触发 `<` 的回答），历史里塞一段未闭合泄漏标记：
+
+| 驱动 | 可用 | 泄漏 | 参数逐字节 | 延迟 | 配额 |
+| --- | --- | --- | --- | --- | --- |
+| WorkBuddy | 6/6 | 0 | YES | 1.6–2.1s | 7,155 积分不变 |
+| Qoder | 6/6 | 0 | YES | 1.2–10s | 1,652 credits |
+
+含 `<` 的回答完整到达，例如 Qoder：
+
+    In JavaScript, `<` is the less-than relational operator, which compares its two
+    operands—coercing…（修复前这类回答会被砍掉一半）
+
+**Qoder 队列实测**：11 个模型全部真实作答（8–14 秒），8 个模型带工具调用全部成功
+（9.7–11.9 秒），无一排队。之前观察到的 4000+ 排队是瞬时拥堵窗口，不是常态 —— 我曾在
+那个窗口里做检查，把临时状况误判为架构问题。价格与排队深度未发现相关性。
+
+**Qoder 15 分钟队列预算真机验证**：在拥堵窗口内实测 +935s 精确触发，先播报
+`queued behind the vendor's model — 4451 requests ahead, roughly 8 minutes to go`，
+到点以 `TIMEOUT` 结束并附最新位置与重试建议。修复前同样情形是沉默一小时。
+
+**一个被排除的假象**：验收中 WorkBuddy 曾说 `my tool calls keep coming back as bare "ok"`。
+追查确认是探针脚本用字面量 `ok` 当工具返回值所致；换成真实多行工具输出后，模型正确
+转述了 `Get-Date` 的结果，无任何抱怨。非插件缺陷。
+
 ## 三、过程中的方法教训（已写入提交信息）
 
 1. **判据写错拼法是静默失效**。`hasUnclosedCallMarkup` 第一版数 ASCII `|`，而规范化器
@@ -111,19 +140,35 @@ dfmodel 前面排 9741 个请求，预计 54 分钟。账户在扣（实测 2493
    直接断言 `failure.code` 是我搞错了层，现在两层各测各的事实。
 6. **过滤管道本身会丢结论**。`Select-Object -First 30` 要凑够行数才输出，导致 25 分钟
    看不到日志、误判为挂死。改为直接写文件。
+7. **只证明"问题不再出现"不算通过，还要证明"别的东西没坏"**（F-079 的代价）。上一轮
+   修泄漏时引入的截断回归，把任何含 `<` 的正常回答砍半（实测 5 条真实回答里 2 条受损、
+   共 121 字符），而当时全量测试是绿的 —— 因为没有一条测试问过"守卫会不会吃掉正确
+   答案"。现在 `test/prose-safety.mjs` 专门守这个方向。
+8. **测试的判据和被测代码一样可能出错**。`history-scrub` 原来用手写正则作判据，列了
+   `invoke`/`parameter` 却漏了 `tool_call`/`antml`，导致新增的三个用例根本没被检查，
+   反向验证假通过。改为调用模块自己的 `hasLeak`。
 
 ## 四、未决项
 
 - **Qoder 的架构性脆弱**：`--disallowed-tools *` 让原生工具调用不可用，文本标记回收是
   唯一路径，本质上比 WorkBuddy 的原生调用脆。真正的解法是原生调用，但这需要确认 Qoder
-  CLI 去掉该 flag 后是否支持 `tools` 参数 —— 未验证。
+  CLI 去掉该 flag 后是否支持 `tools` 参数 —— 未验证。**这是已知风险，不是已知故障**：
+  当前两个驱动的实测结果都是 0 泄漏。
 - **WorkBuddy 不出推理**：`deepseek-v4.1-flash` 的 reasoning 恒为 0 字节。不是缺陷，
   是该模型不上报思考内容。
+- **Qoder 厂商侧队列**：插件无法控制排队深度，只能如实播报并在预算内结束。若长期拥堵，
+  可换模型（11 个可选）或改用 WorkBuddy。
 - 推送曾多次因网络失败（`Connection was reset` / 443 超时），当前已全部推送。
 
 ## 五、交付索引
 
-- 项目：`D:\dshWork\CyberWork\10_active\dsh-agent-bridge`（分支 main，最新 `1097e72`）
+- 项目：`D:\dshWork\CyberWork\10_active\dsh-agent-bridge`（分支 main，最新 `2dc5a0c`）
 - 关键改动：`lib/dsml.js`、`lib/messages.js`、`lib/catalog.js`、`lib/adapter.js`、
   `drivers/qoder/conversation.js`、`drivers/workbuddy/conversation.js`
+- 新增测试：`test/dsml-spelling-matrix.mjs`、`test/dsml-stream-matrix.mjs`、
+  `test/qoder-reasoning.mjs`、`test/workbuddy-reasoning.mjs`、`test/history-scrub.mjs`、
+  `test/prose-safety.mjs`、`test/quota-refresh.mjs`、`test/qoder-queue.mjs`
+- 测试总数 75，`npm run check` exit 0
 - 已同步到 `~/.dsh/profiles/desktop/node_modules/dsh-agent-bridge/`，哈希一致
+- 缺陷编号 F-001…F-079 全部处理完毕
+
